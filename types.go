@@ -1,6 +1,9 @@
 package caddyadmin
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Route represents a single Caddy route with optional @id for stable identification.
 // See: https://caddyserver.com/docs/api#using-stable-ids
@@ -131,14 +134,20 @@ func (c *Config) JSON() ([]byte, error) {
 }
 
 // AdminConfig corresponds to the top-level `admin` block.
-//
-// Security: Origins MUST be an explicit allowlist (e.g. ["127.0.0.1"]).
-// Setting Origins to ["*"] exposes the admin API to the network and is a
-// remote takeover vector. Tests assert "*" never appears in the output.
 type AdminConfig struct {
-	Listen  string   `json:"listen"`           // e.g. "127.0.0.1:2019"
-	Origins []string `json:"origins,omitempty"` // MUST be explicit; NEVER ["*"]
-	Persist *bool    `json:"persist,omitempty"` // nil = Caddy default
+	Listen  string   `json:"listen"`            // e.g. "127.0.0.1:2019"
+	Origins []string `json:"origins,omitempty"`  // explicit allowlist; NEVER contain "*"
+	Persist *bool    `json:"persist,omitempty"`  // nil = Caddy default
+}
+
+// Validate checks for security-sensitive misconfigurations.
+func (a *AdminConfig) Validate() error {
+	for _, o := range a.Origins {
+		if o == "*" {
+			return fmt.Errorf("caddyadmin: admin origin must not be wildcard '*' — exposes admin API to network")
+		}
+	}
+	return nil
 }
 
 // LogsConfig corresponds to the top-level `logging` block.
@@ -287,7 +296,13 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 	}
 
 	if h.Handler == "static_response" {
-		// Flatten HeaderPolicy.Response.Set to the flat map Caddy expects.
+		// Caddy's static_response only supports Response.Set as a flat map.
+		if h.Headers.Response != nil && (len(h.Headers.Response.Add) > 0 || len(h.Headers.Response.Delete) > 0) {
+			return nil, fmt.Errorf("caddyadmin: static_response handler does not support header Add/Delete operations")
+		}
+		if h.Headers.Request != nil {
+			return nil, fmt.Errorf("caddyadmin: static_response handler does not support request headers")
+		}
 		flat := map[string][]string{}
 		if h.Headers.Response != nil {
 			for k, v := range h.Headers.Response.Set {
@@ -299,23 +314,27 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 	return marshalHandlerWithHeaders(raw, h.Headers)
 }
 
-// marshalHandlerWithHeaders builds the JSON by marshaling raw first, then
-// injecting `headers` with the given value (which must be either a *HeaderPolicy
-// for nested shape or a map[string][]string for flat shape).
+// marshalHandlerWithHeaders builds the JSON by combining handlerRaw fields and
+// headers into a single map, avoiding fragile byte-level JSON manipulation.
 func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
-	b, err := json.Marshal(raw)
-	if err != nil {
-		return nil, err
+	m := map[string]any{
+		"handler": raw.Handler,
+		"headers": headers,
 	}
-	hb, err := json.Marshal(headers)
-	if err != nil {
-		return nil, err
+	if raw.Upstreams != nil {
+		m["upstreams"] = raw.Upstreams
 	}
-	// Inject before the closing brace. b always ends with '}' since raw is a struct.
-	out := make([]byte, 0, len(b)+len(hb)+12)
-	out = append(out, b[:len(b)-1]...)  // strip '}'
-	out = append(out, `,"headers":`...)
-	out = append(out, hb...)
-	out = append(out, '}')
-	return out, nil
+	if raw.StatusCode != 0 {
+		m["status_code"] = raw.StatusCode
+	}
+	if raw.Body != "" {
+		m["body"] = raw.Body
+	}
+	if raw.URI != "" {
+		m["uri"] = raw.URI
+	}
+	if raw.Routes != nil {
+		m["routes"] = raw.Routes
+	}
+	return json.Marshal(m)
 }
