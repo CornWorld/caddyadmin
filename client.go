@@ -187,6 +187,29 @@ func (c *Client) RemoveRouteByID(id string) error {
 	return c.deleteRaw("/id/" + id)
 }
 
+// --- Server info ---
+
+// Version returns the Caddy version info.
+// GET /version, with fallback to GET /config.
+func (c *Client) Version() (map[string]any, error) {
+	raw, err := c.getRaw("/version")
+	if err == nil {
+		var result map[string]any
+		if err := json.Unmarshal(raw, &result); err == nil {
+			return result, nil
+		}
+	}
+	// Fallback: admin API is reachable but /version may not be available
+	// in all deployments (e.g. older Caddy versions).
+	if _, err := c.getRaw("/config/"); err == nil {
+		return map[string]any{
+			"app_name":    "Caddy",
+			"app_version": "Admin API reachable",
+		}, nil
+	}
+	return nil, fmt.Errorf("caddyadmin: failed to get version: %w", err)
+}
+
 // --- Low-level HTTP helpers ---
 
 func (c *Client) getRaw(path string) (json.RawMessage, error) {
