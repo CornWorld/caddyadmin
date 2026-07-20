@@ -1,0 +1,7 @@
+# Binaries
+*.test
+*.out
+# IDE
+.idea/
+.vscode/
+*.swp
