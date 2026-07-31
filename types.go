@@ -3,6 +3,10 @@ package caddyadmin
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"net"
+	"slices"
+	"strings"
 )
 
 // Route represents a single Caddy route with optional @id for stable identification.
@@ -34,11 +38,22 @@ type MatchRule struct {
 	// Method matches HTTP methods: ["GET", "POST"]
 	Method []string `json:"method,omitempty"`
 
-	// NotIP matches when the client IP is NOT in the list.
-	NotIP []string `json:"not_ip,omitempty"`
+	// RemoteIP matches when the client IP is (or is not) in the given CIDR
+	// ranges. Maps to Caddy's `remote_ip` request matcher:
+	//
+	//	{"remote_ip": {"ranges": [...], "except": [...]}}
+	//
+	// Ranges are CIDR blocks to match; Except excludes specific IPs (negation).
+	// Caddy has no bare `ip`/`not_ip` matcher modules — the old IP/NotIP fields
+	// emitted keys Caddy rejects, so they were replaced with this shape.
+	RemoteIP *RemoteIPMatch `json:"remote_ip,omitempty"`
+}
 
-	// IP matches when the client IP IS in the list.
-	IP []string `json:"ip,omitempty"`
+// RemoteIPMatch is the value of Caddy's `remote_ip` request matcher.
+// See: https://caddyserver.com/docs/json/apps/http/servers/routes/match/remote_ip
+type RemoteIPMatch struct {
+	Ranges []string `json:"ranges,omitempty"` // CIDR ranges to match (e.g. ["192.168.0.0/16"])
+	Except []string `json:"except,omitempty"` // IPs to exclude (e.g. ["192.168.1.1"])
 }
 
 // Handler defines a single Caddy handler. Different handler types use different fields.
@@ -127,27 +142,59 @@ type Config struct {
 }
 
 // JSON returns the canonical Caddy-compatible JSON encoding of the config.
-// It is exactly json.Marshal; provided as a convenience so callers don't
-// have to import encoding/json just to serialize a Config.
+// It validates the admin security contract first, then marshals. Unlike a
+// bare json.Marshal, it refuses to serialize a config that would expose the
+// unauthenticated admin API to the network (wildcard origins / non-loopback
+// listen) — callers must run AdminConfig.Validate() or use Config.JSON().
 func (c *Config) JSON() ([]byte, error) {
+	if c.Admin != nil {
+		if err := c.Admin.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	return json.Marshal(c)
 }
 
 // AdminConfig corresponds to the top-level `admin` block.
 type AdminConfig struct {
 	Listen  string   `json:"listen"`            // e.g. "127.0.0.1:2019"
-	Origins []string `json:"origins,omitempty"`  // explicit allowlist; NEVER contain "*"
-	Persist *bool    `json:"persist,omitempty"`  // nil = Caddy default
+	Origins []string `json:"origins,omitempty"` // explicit allowlist; NEVER contain "*"
+	Persist *bool    `json:"persist,omitempty"` // nil = Caddy default
 }
 
 // Validate checks for security-sensitive misconfigurations.
 func (a *AdminConfig) Validate() error {
-	for _, o := range a.Origins {
-		if o == "*" {
-			return fmt.Errorf("caddyadmin: admin origin must not be wildcard '*' — exposes admin API to network")
-		}
+	if slices.Contains(a.Origins, "*") {
+		return fmt.Errorf("caddyadmin: admin origin must not be wildcard '*' — exposes admin API to network")
+	}
+	return a.validateListen()
+}
+
+// validateListen rejects binding the admin API to a non-loopback interface.
+// The admin API has no authentication (see README gotcha #6); exposing it to
+// the network would let anyone read or replace the running Caddy config.
+func (a *AdminConfig) validateListen() error {
+	if a.Listen == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(a.Listen)
+	if err != nil {
+		// Not a host:port address (e.g. a Unix socket); let Caddy resolve it.
+		return nil
+	}
+	if host == "" || !isLoopbackHost(host) {
+		return fmt.Errorf("caddyadmin: admin listen %q must bind to a loopback address (e.g. 127.0.0.1:2019) — the admin API has no auth and must not be exposed to the network", a.Listen)
 	}
 	return nil
+}
+
+// isLoopbackHost reports whether host is "localhost" or a loopback IP address.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // LogsConfig corresponds to the top-level `logging` block.
@@ -174,7 +221,7 @@ type LogEntry struct {
 // LogWriter is the writer configuration for a log entry.
 // See: https://caddyserver.com/docs/json/logging/#logs
 type LogWriter struct {
-	Output   string `json:"output"`            // "file" / "stderr" / "stdout" / "net"
+	Output   string `json:"output"`             // "file" / "stderr" / "stdout" / "net"
 	Filename string `json:"filename,omitempty"` // for output="file"
 }
 
@@ -200,10 +247,10 @@ type HTTPApp struct {
 // Server corresponds to apps.http.servers.{name}. It is a named HTTP listener
 // (e.g. "srv0" for :443, "srv1" for :80 redirect, "srv_mgmt" for :8080).
 type Server struct {
-	Listen           []string         `json:"listen,omitempty"` // [":443"], [":80"], [":8080"]
-	Routes           []Route          `json:"routes,omitempty"`
+	Listen           []string          `json:"listen,omitempty"` // [":443"], [":80"], [":8080"]
+	Routes           []Route           `json:"routes,omitempty"`
 	ListenerWrappers []ListenerWrapper `json:"listener_wrappers,omitempty"` // e.g. http_redirect
-	Logs             *ServerLogs      `json:"logs,omitempty"`
+	Logs             *ServerLogs       `json:"logs,omitempty"`
 	// TLS connection policies are intentionally NOT modeled here: under
 	// automatic HTTPS, Caddy generates them itself. Declaring them manually
 	// fights Caddy's automation and is a known foot-gun.
@@ -268,12 +315,12 @@ type Issuer struct {
 // handlerRaw is the default marshal output of Handler with the Headers field
 // omitted. MarshalJSON fills Headers separately depending on Handler kind.
 type handlerRaw struct {
-	Handler    string    `json:"handler"`
+	Handler    string     `json:"handler"`
 	Upstreams  []Upstream `json:"upstreams,omitempty"`
-	StatusCode int       `json:"status_code,omitempty"`
-	Body       string    `json:"body,omitempty"`
-	URI        string    `json:"uri,omitempty"`
-	Routes     []Route   `json:"routes,omitempty"`
+	StatusCode int        `json:"status_code,omitempty"`
+	Body       string     `json:"body,omitempty"`
+	URI        string     `json:"uri,omitempty"`
+	Routes     []Route    `json:"routes,omitempty"`
 }
 
 // MarshalJSON serializes Handler. For static_response it emits Headers as a
@@ -305,9 +352,7 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 		}
 		flat := map[string][]string{}
 		if h.Headers.Response != nil {
-			for k, v := range h.Headers.Response.Set {
-				flat[k] = v
-			}
+			maps.Copy(flat, h.Headers.Response.Set)
 		}
 		return marshalHandlerWithHeaders(raw, flat)
 	}
@@ -337,4 +382,67 @@ func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
 		m["routes"] = raw.Routes
 	}
 	return json.Marshal(m)
+}
+
+// UnmarshalJSON decodes a Handler, mirroring MarshalJSON's per-handler
+// Headers shape. static_response handlers carry a flat map[string][]string
+// (http.Header shape); every other handler carries the nested HeaderPolicy
+// shape. This makes round-tripping a live config (GET /config then edit)
+// lossless instead of silently dropping static_response header manipulation.
+func (h *Handler) UnmarshalJSON(data []byte) error {
+	// Decode into a map first so we can dispatch on the handler name.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	decode := func(key string, out any) error {
+		v, ok := raw[key]
+		if !ok || len(v) == 0 || string(v) == "null" {
+			return nil
+		}
+		return json.Unmarshal(v, out)
+	}
+
+	if err := decode("handler", &h.Handler); err != nil {
+		return err
+	}
+	if err := decode("upstreams", &h.Upstreams); err != nil {
+		return err
+	}
+	if err := decode("status_code", &h.StatusCode); err != nil {
+		return err
+	}
+	if err := decode("body", &h.Body); err != nil {
+		return err
+	}
+	if err := decode("uri", &h.URI); err != nil {
+		return err
+	}
+	if err := decode("routes", &h.Routes); err != nil {
+		return err
+	}
+
+	hdr, ok := raw["headers"]
+	if !ok || len(hdr) == 0 || string(hdr) == "null" {
+		return nil
+	}
+
+	if h.Handler == "static_response" {
+		// static_response headers are a flat http.Header map.
+		var flat map[string][]string
+		if err := json.Unmarshal(hdr, &flat); err != nil {
+			return err
+		}
+		h.Headers = &HeaderPolicy{Response: &HeaderOps{Set: flat}}
+		return nil
+	}
+
+	// All other handlers use the nested HeaderPolicy shape.
+	var hp HeaderPolicy
+	if err := json.Unmarshal(hdr, &hp); err != nil {
+		return err
+	}
+	h.Headers = &hp
+	return nil
 }

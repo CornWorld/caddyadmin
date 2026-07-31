@@ -24,10 +24,13 @@ func newMockCaddy(t *testing.T) (*httptest.Server, *mockState) {
 }
 
 type mockState struct {
-	config  map[string]any
-	subjects []string
-	listen  []string
+	config           map[string]any
+	subjects         []string
+	listen           []string
 	listenerWrappers []map[string]string
+	// requestPaths records the escaped paths of requests that hit the /id/ and
+	// /config/ subtree handlers, used to assert URL-escaping of user input.
+	requestPaths []string
 
 	// loadHandler, if non-nil, overrides the default /load handler.
 	// It receives the request and a call counter (1-based); tests use this to
@@ -76,6 +79,25 @@ func registerMockHandlers(mux *http.ServeMux, s *mockState) {
 			s.listenerWrappers = nil
 		}
 		w.WriteHeader(http.StatusOK)
+	})
+
+	// DELETE /id/{id} — records the escaped request path so tests can assert
+	// URL-escaping of user-supplied @id values.
+	mux.HandleFunc("/id/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.requestPaths = append(s.requestPaths, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// /config/{path} subtree — records the escaped request path for tests that
+	// verify URL-escaping of server names in config subtree requests.
+	mux.HandleFunc("/config/", func(w http.ResponseWriter, r *http.Request) {
+		s.requestPaths = append(s.requestPaths, r.URL.EscapedPath())
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
 	})
 }
 

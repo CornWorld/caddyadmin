@@ -49,18 +49,18 @@ func main() {
 
 ## API Client Reference
 
-| Method | HTTP | Caddy Endpoint |
-|---|---|---|
-| `NewClient(baseURL string) *Client` | — | Constructor. Strips trailing `/`. Uses 10s timeout, HTTP/1.1 only, no compression. |
-| `GetConfig() (json.RawMessage, error)` | GET | `/config` — full running config |
-| `LoadConfig(config json.RawMessage) error` | POST | `/load` — replace entire config atomically |
-| `ValidateConfig(config json.RawMessage) error` | POST | `/load?validate_only=true` — dry-run validation |
-| `GetConfigPath(path string) (json.RawMessage, error)` | GET | `/config/{path}` — config subtree |
-| `GetRoutes(serverName string) ([]Route, error)` | GET | `/config/apps/http/servers/{name}/routes` |
-| `GetAutocertDomains() ([]string, error)` | GET | `/config/apps/tls/certificates/automate` |
-| `AddRoute(serverName string, route *Route) error` | POST | `/config/apps/http/servers/{name}/routes` |
-| `RemoveRouteByID(id string) error` | DELETE | `/id/{id}` — delete by stable `@id` |
-| `Version() (map[string]any, error)` | GET | `/version` (falls back to `/config` for older Caddy) |
+| Method                                                | HTTP   | Caddy Endpoint                                                                     |
+| ----------------------------------------------------- | ------ | ---------------------------------------------------------------------------------- |
+| `NewClient(baseURL string) *Client`                   | —      | Constructor. Strips trailing `/`. Uses 10s timeout, HTTP/1.1 only, no compression. |
+| `GetConfig() (json.RawMessage, error)`                | GET    | `/config` — full running config                                                    |
+| `LoadConfig(config json.RawMessage) error`            | POST   | `/load` — replace entire config atomically                                         |
+| `ValidateConfig(config json.RawMessage) error`        | POST   | `/load?validate_only=true` — dry-run validation                                    |
+| `GetConfigPath(path string) (json.RawMessage, error)` | GET    | `/config/{path}` — config subtree                                                  |
+| `GetRoutes(serverName string) ([]Route, error)`       | GET    | `/config/apps/http/servers/{name}/routes`                                          |
+| `GetAutocertDomains() ([]string, error)`              | GET    | `/config/apps/tls/certificates/automate`                                           |
+| `AddRoute(serverName string, route *Route) error`     | POST   | `/config/apps/http/servers/{name}/routes`                                          |
+| `RemoveRouteByID(id string) error`                    | DELETE | `/id/{id}` — delete by stable `@id`                                                |
+| `Version() (map[string]any, error)`                   | GET    | `/version` (falls back to `/config` for older Caddy)                               |
 
 ---
 
@@ -223,13 +223,17 @@ type Issuer struct {
 ## Key Gotchas
 
 ### 1. Caddy Admin Is HTTP/1.1 Only
+
 The admin endpoint does not support HTTP/2. The client explicitly sets `ForceAttemptHTTP2: false`. Do not configure H2 on the admin listener.
 
 ### 2. Compression Disabled
+
 `DisableCompression: true` — avoids gzip-related issues on the admin port. All responses are read as-is.
 
 ### 3. LoadConfig Retries Transient Errors
+
 `LoadConfig` retries up to **3 times with 500ms delay** for:
+
 - `io.EOF` / `io.ErrUnexpectedEOF`
 - `syscall.ECONNRESET` (connection reset)
 - `syscall.EPIPE` (broken pipe)
@@ -238,30 +242,55 @@ The admin endpoint does not support HTTP/2. The client explicitly sets `ForceAtt
 4xx errors are **never retried** — they indicate a client-side problem. This retry logic exists because Caddy's admin endpoint may reset the connection during config reloads.
 
 ### 4. Handler JSON Shape Changes by Module
+
 The `Handler.Headers` field marshals differently depending on `Handler.Handler`:
+
 - **`static_response`**: headers marshal as a flat `map[string][]string` (http.Header shape). Add/Delete/Request sub-fields are rejected with an error.
 - **All other modules** (`reverse_proxy`, `rewrite`, etc.): headers marshal as the full nested `HeaderPolicy` object (`{request: ..., response: ...}`).
 
-### 5. AdminConfig.Origins — Never Wildcard
-`AdminConfig.Validate()` returns an error if `Origins` contains `"*"`. This is a deliberate security measure — the admin API should never be accessible from arbitrary origins. Use explicit origin values only.
+### 5. AdminConfig.Validate() — Loopback-Only Admin
+
+`AdminConfig.Validate()` returns an error if `Origins` contains `"*"`, or if `Listen` is not bound to a loopback address (`127.0.0.1`, `::1`, `localhost`). This is a deliberate security measure — the admin API has no auth and should never be reachable from the network. Use explicit origin values and a loopback bind only.
 
 ### 6. No Authentication
+
 Caddy's admin API has no built-in auth mechanism. It is designed to bind to localhost only (`127.0.0.1:2019`). Never expose it to a network interface without additional protection.
 
 ### 7. Routes Use @id for Stable Identification
+
 Routes are identified by their `@id` field (JSON tag `@id`). This is used by `RemoveRouteByID()` which calls `DELETE /id/{id}`. Without a set `@id`, a route cannot be deleted or updated individually — you'd have to reload the entire config.
 
 ### 8. Base URL Trailing Slash Trimmed
+
 `NewClient` strips any trailing `/` from the base URL. All paths are appended directly, so `http://127.0.0.1:2019/` and `http://127.0.0.1:2019` produce identical behavior.
 
 ### 9. Version() Fallback
+
 `Version()` tries `GET /version` first. If that fails (older Caddy versions), it falls back to extracting version info from `GET /config`.
 
 ### 10. Zero External Dependencies
+
 The entire library uses only the Go standard library:
 `encoding/json`, `errors`, `fmt`, `io`, `net/http`, `os`, `strings`, `time`, `context`, `bytes`.
 
 Easy to audit, vendor, and maintain.
+
+### 12. Config.JSON() Validates Before Serializing
+
+`Config.JSON()` runs `AdminConfig.Validate()` (loopback-only `listen`, no wildcard
+`origins`) before marshaling. A config that would expose the unauthenticated
+admin API to the network is refused with an error. `Route` matching uses Caddy's
+`remote_ip` matcher (`{"remote_ip": {"ranges": [...], "except": [...]}}`) — Caddy
+rejects a bare `ip`/`not_ip` key.
+
+### 11. URL Path Segments Are Escaped
+
+`GetRoutes`, `AddRoute`, `RemoveRouteByID`, and `GetConfigPath` URL-path-escape
+user-supplied names (`serverName`, `@id`) before building the admin request URL.
+Special characters (e.g. `/`, `?`, `#`, spaces) cannot inject extra path segments
+or query strings into the request. Dot-only segments (`.`, `..`) are percent-encoded
+(`%2E`) so they cannot be normalized into a path traversal.
+`GetConfigPath("")` targets the root `/config` endpoint.
 
 ---
 

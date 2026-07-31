@@ -90,7 +90,7 @@ func resetConfig(t *testing.T, c *Client) {
 	// LoadConfig may return EOF/connection-reset because Caddy restarts
 	// the admin endpoint during config reload. This is expected behavior.
 	// We retry with a delay.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		err := c.LoadConfig(minimal)
 		if err == nil {
 			return
@@ -242,5 +242,82 @@ func TestValidateConfig(t *testing.T) {
 	// validate_only must NOT replace stored config.
 	if existing, ok := state.config["existing"]; !ok || existing != true {
 		t.Fatalf("ValidateConfig mutated stored config: %+v", state.config)
+	}
+}
+
+// TestGetConfigPathEmpty verifies GetConfigPath("") targets the root config
+// endpoint (/config) instead of the subtree endpoint with a trailing slash.
+func TestGetConfigPathEmpty(t *testing.T) {
+	server, state := newMockCaddy(t)
+	c := NewClient(server.URL)
+
+	state.config = map[string]any{"key": "value"}
+	raw, err := c.GetConfigPath("")
+	if err != nil {
+		t.Fatalf("GetConfigPath(\"\") failed: %v", err)
+	}
+	if !strings.Contains(string(raw), `"key":"value"`) {
+		t.Fatalf("expected root config body, got: %s", raw)
+	}
+	// The root "/config" handler must be hit, not the "/config/" subtree handler.
+	if len(state.requestPaths) != 0 {
+		t.Fatalf("GetConfigPath(\"\") unexpectedly hit a subtree handler: %v", state.requestPaths)
+	}
+}
+
+// TestURLPathEscaping verifies that user-supplied server names and @id values
+// are URL-path-escaped before being interpolated into admin request paths, so
+// they cannot inject extra path segments or query strings.
+func TestURLPathEscaping(t *testing.T) {
+	server, state := newMockCaddy(t)
+	c := NewClient(server.URL)
+
+	if err := c.RemoveRouteByID("a/b?c#d"); err != nil {
+		t.Fatalf("RemoveRouteByID failed: %v", err)
+	}
+	if err := c.AddRoute("srv 1", &Route{}); err != nil {
+		t.Fatalf("AddRoute failed: %v", err)
+	}
+	if _, err := c.GetRoutes("srv 1"); err != nil {
+		t.Fatalf("GetRoutes failed: %v", err)
+	}
+	if _, err := c.GetConfigPath("apps/http/servers/srv 1/routes"); err != nil {
+		t.Fatalf("GetConfigPath failed: %v", err)
+	}
+	// Dot-only segments ("..") must be percent-encoded so they cannot be
+	// normalized by the server into a path traversal.
+	if _, err := c.GetConfigPath("apps/../admin"); err != nil {
+		t.Fatalf("GetConfigPath with dot segment failed: %v", err)
+	}
+
+	want := []string{
+		"/id/a%2Fb%3Fc%23d",
+		"/config/apps/http/servers/srv%201/routes",
+		"/config/apps/http/servers/srv%201/routes",
+		"/config/apps/http/servers/srv%201/routes",
+		"/config/apps/%2E%2E/admin",
+	}
+	if len(state.requestPaths) != len(want) {
+		t.Fatalf("expected %d recorded paths, got %d: %v", len(want), len(state.requestPaths), state.requestPaths)
+	}
+	for i, p := range want {
+		if state.requestPaths[i] != p {
+			t.Errorf("request[%d]: expected %q, got %q", i, p, state.requestPaths[i])
+		}
+	}
+}
+
+// TestVersionFallback verifies Version() falls back to GET /config when the
+// /version endpoint is unavailable (e.g. older Caddy deployments).
+func TestVersionFallback(t *testing.T) {
+	server, _ := newMockCaddy(t)
+	c := NewClient(server.URL)
+
+	v, err := c.Version()
+	if err != nil {
+		t.Fatalf("Version() fallback failed: %v", err)
+	}
+	if v["app_version"] != "Admin API reachable" {
+		t.Fatalf("expected fallback app_version, got: %v", v)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -74,7 +75,7 @@ func (c *Client) GetConfig() (json.RawMessage, error) {
 // 400 Bad Request from an invalid config) is returned immediately.
 func (c *Client) LoadConfig(config json.RawMessage) error {
 	var lastErr error
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		err := c.postRaw("/load", config, nil)
 		if err == nil {
 			return nil
@@ -83,7 +84,9 @@ func (c *Client) LoadConfig(config json.RawMessage) error {
 		if !isRetryableLoadError(err) {
 			return err
 		}
-		time.Sleep(500 * time.Millisecond)
+		if i < 2 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 	return fmt.Errorf("caddyadmin: LoadConfig failed after 3 retries: %w", lastErr)
 }
@@ -108,17 +111,17 @@ func isRetryableLoadError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "EOF") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe") {
-		return true
-	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	// Classify by status code first: a 4xx response (bad config) must never be
+	// retried even if its body text happens to contain "EOF" / "connection
+	// reset" / "broken pipe". Only fall back to message sniffing for transport
+	// (non-APIError) failures, where Caddy tears down the socket during reload.
+	if apiErr, ok := errors.AsType[*APIError](err); ok {
 		return apiErr.StatusCode >= 500
 	}
-	return false
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 // GetConfigPath returns a specific subtree of the Caddy configuration.
@@ -126,7 +129,11 @@ func isRetryableLoadError(err error) bool {
 //
 // Example: GetConfigPath("apps/http/servers/srv0/routes") -> []Route
 func (c *Client) GetConfigPath(path string) (json.RawMessage, error) {
-	return c.getRaw("/config/" + strings.TrimLeft(path, "/"))
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return c.getRaw("/config")
+	}
+	return c.getRaw("/config/" + escapePathURL(path))
 }
 
 // --- HTTP server status inspection ---
@@ -135,8 +142,8 @@ func (c *Client) GetConfigPath(path string) (json.RawMessage, error) {
 // inspection used by GetTLSStatus to detect "still in maintenance mode".
 // GET /config/apps/http/servers/{serverName}/routes
 func (c *Client) GetRoutes(serverName string) ([]Route, error) {
-	path := fmt.Sprintf("apps/http/servers/%s/routes", serverName)
-	raw, err := c.getRaw("/config/" + path)
+	path := "/config/apps/http/servers/" + escapePathSegment(serverName) + "/routes"
+	raw, err := c.getRaw(path)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +180,7 @@ func (c *Client) GetAutocertDomains() ([]string, error) {
 // AddRoute appends a single route to a server's routes array.
 // POST /config/apps/http/servers/{serverName}/routes
 func (c *Client) AddRoute(serverName string, route *Route) error {
-	path := fmt.Sprintf("/config/apps/http/servers/%s/routes", serverName)
+	path := "/config/apps/http/servers/" + escapePathSegment(serverName) + "/routes"
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("caddyadmin: failed to marshal route: %w", err)
@@ -184,7 +191,7 @@ func (c *Client) AddRoute(serverName string, route *Route) error {
 // RemoveRouteByID deletes a route by its @id stable identifier.
 // DELETE /id/{id}
 func (c *Client) RemoveRouteByID(id string) error {
-	return c.deleteRaw("/id/" + id)
+	return c.deleteRaw("/id/" + escapePathSegment(id))
 }
 
 // --- Server info ---
@@ -201,7 +208,7 @@ func (c *Client) Version() (map[string]any, error) {
 	}
 	// Fallback: admin API is reachable but /version may not be available
 	// in all deployments (e.g. older Caddy versions).
-	if _, err := c.getRaw("/config/"); err == nil {
+	if _, err := c.getRaw("/config"); err == nil {
 		return map[string]any{
 			"app_name":    "Caddy",
 			"app_version": "Admin API reachable",
@@ -228,6 +235,35 @@ func (c *Client) deleteRaw(path string) error {
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// escapePathURL escapes each slash-separated segment of a Caddy config path so
+// that a multi-segment path (e.g. "apps/http/servers/srv0/routes") cannot be
+// altered by injected path segments, query strings, or dot segments. It splits
+// on "/" and escapes every segment individually.
+func escapePathURL(path string) string {
+	segs := strings.Split(path, "/")
+	for i, s := range segs {
+		segs[i] = escapePathSegment(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// escapePathSegment escapes a SINGLE logical URL path segment (a server name or
+// @id value) so it cannot introduce extra "/" separators, query strings, or
+// fragment separators into the admin request URL. It must be applied BEFORE the
+// value is interpolated into a path, otherwise a "/" in the value becomes an
+// additional path segment (e.g. serverName "foo/../tls" reaching an arbitrary
+// subtree).
+//
+// Dot-only segments (".", "..", "...") are handled specially: url.PathEscape
+// leaves them as-is, and a server may normalize ".." into a path traversal.
+// Encoding each dot ("%2E") keeps the segment a literal config key.
+func escapePathSegment(s string) string {
+	if s != "" && strings.Trim(s, ".") == "" {
+		return strings.Repeat("%2E", len(s))
+	}
+	return url.PathEscape(s)
 }
 
 func (c *Client) postRaw(path string, body []byte, out any) error {

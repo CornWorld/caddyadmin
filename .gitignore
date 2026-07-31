@@ -1,7 +1,21 @@
-# Binaries
+# Binaries / test artifacts
 *.test
-*.out
+*.test.out
+# Coverage output (scoped, not all *.out — build outputs may be meaningful)
+coverage.out
+# Secrets / credentials — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*.local
 # IDE
 .idea/
 .vscode/
 *.swp
+# Snow CLI local tool state (notebook / plan / settings)
+.snow/

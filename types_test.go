@@ -193,9 +193,68 @@ func TestConfigEmptyOmitsFields(t *testing.T) {
 	}
 }
 
+// TestConfigJSONValidatesAdmin verifies that Config.JSON() refuses to
+// serialize a config whose admin block would expose the unauthenticated admin
+// API (wildcard origins or a non-loopback listen), even though a bare
+// json.Marshal would happily emit it.
+func TestConfigJSONValidatesAdmin(t *testing.T) {
+	bad := []*Config{
+		{Admin: &AdminConfig{Listen: "127.0.0.1:2019", Origins: []string{"*"}}},
+		{Admin: &AdminConfig{Listen: "0.0.0.0:2019", Origins: []string{"127.0.0.1"}}},
+		{Admin: &AdminConfig{Listen: ":2019"}},
+	}
+	for i, cfg := range bad {
+		if _, err := cfg.JSON(); err == nil {
+			t.Errorf("bad[%d]: Config.JSON() accepted an insecure admin block", i)
+		}
+		// A bare json.Marshal must NOT be blocked — only Config.JSON() enforces it.
+		if _, err := json.Marshal(cfg); err != nil {
+			t.Errorf("bad[%d]: json.Marshal should not validate: %v", i, err)
+		}
+	}
+}
+
+// TestHandlerUnmarshalJSONRoundTrip verifies Handler.UnmarshalJSON mirrors
+// MarshalJSON for both the flat static_response header shape and the nested
+// HeaderPolicy shape, so live configs round-trip losslessly.
+func TestHandlerUnmarshalJSONRoundTrip(t *testing.T) {
+	// static_response: flat http.Header map
+	sr := Handler{Handler: "static_response", StatusCode: 200, Body: "ok", Headers: &HeaderPolicy{
+		Response: &HeaderOps{Set: map[string][]string{"Content-Type": {"text/plain"}}},
+	}}
+	data, err := json.Marshal(sr)
+	if err != nil {
+		t.Fatalf("marshal static_response: %v", err)
+	}
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal static_response: %v", err)
+	}
+	if back.Headers == nil || back.Headers.Response == nil || back.Headers.Response.Set["Content-Type"][0] != "text/plain" {
+		t.Fatalf("static_response headers lost in round-trip: %+v", back.Headers)
+	}
+
+	// reverse_proxy: nested HeaderPolicy
+	rp := Handler{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "127.0.0.1:8090"}}, Headers: &HeaderPolicy{
+		Request: &HeaderOps{Set: map[string][]string{"X-Foo": {"bar"}}},
+	}}
+	data, err = json.Marshal(rp)
+	if err != nil {
+		t.Fatalf("marshal reverse_proxy: %v", err)
+	}
+	back = Handler{}
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal reverse_proxy: %v", err)
+	}
+	if back.Headers == nil || back.Headers.Request == nil || back.Headers.Request.Set["X-Foo"][0] != "bar" {
+		t.Fatalf("reverse_proxy headers lost in round-trip: %+v", back.Headers)
+	}
+}
+
 // TestConfigJSONMethodEquivalence verifies that Config.JSON() and
-// json.Marshal(*Config) produce identical output. The method is documented as
-// a convenience wrapper; callers must not be surprised by a difference.
+// json.Marshal(*Config) produce identical output for a VALID config. JSON()
+// additionally enforces the admin security contract; for a valid admin block
+// the two must agree so callers are never surprised by a difference.
 func TestConfigJSONMethodEquivalence(t *testing.T) {
 	cfg := &Config{
 		Admin: &AdminConfig{
@@ -231,5 +290,32 @@ func TestAdminConfigOriginsRequired(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"*"`) {
 		t.Fatal("admin.origins must never contain \"*\"")
+	}
+}
+
+// TestAdminConfigValidateRejectsNonLoopbackListen pins the security contract
+// that AdminConfig.Validate() rejects binding the admin API to a non-loopback
+// interface (the admin API has no authentication and must stay on localhost).
+func TestAdminConfigValidateRejectsNonLoopbackListen(t *testing.T) {
+	bad := []string{"0.0.0.0:2019", ":2019", "192.168.1.10:2019", "[::]:2019"}
+	for _, listen := range bad {
+		admin := &AdminConfig{Listen: listen, Origins: []string{"127.0.0.1"}}
+		if err := admin.Validate(); err == nil {
+			t.Errorf("Validate() accepted non-loopback listen %q", listen)
+		}
+	}
+
+	good := []string{"127.0.0.1:2019", "localhost:2019", "[::1]:2019", ""}
+	for _, listen := range good {
+		admin := &AdminConfig{Listen: listen, Origins: []string{"127.0.0.1"}}
+		if err := admin.Validate(); err != nil {
+			t.Errorf("Validate() rejected loopback listen %q: %v", listen, err)
+		}
+	}
+
+	// Wildcard origins must still be rejected even with a loopback listen.
+	admin := &AdminConfig{Listen: "127.0.0.1:2019", Origins: []string{"*"}}
+	if err := admin.Validate(); err == nil {
+		t.Fatal("Validate() must still reject wildcard origins")
 	}
 }
