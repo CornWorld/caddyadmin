@@ -142,17 +142,25 @@ type MatchRule struct {
 
 ```go
 type Handler struct {
-    Handler         string        `json:"handler"`             // "reverse_proxy" | "static_response" | "rewrite" | "subroute" | "file_server"
-    Upstreams       []Upstream    `json:"upstreams,omitempty"`
-    Headers         *HeaderPolicy `json:"headers,omitempty"`    // custom MarshalJSON (see Gotchas); rejected for file_server
-    StatusCode      int           `json:"status_code,omitempty"`
-    Body            string        `json:"body,omitempty"`
-    URI             string        `json:"uri,omitempty"`
-    Root            string        `json:"root,omitempty"`       // file_server root directory
-    StripPathPrefix string        `json:"strip_path_prefix,omitempty"` // file_server URL prefix to strip (optional)
-    Routes          []Route       `json:"routes,omitempty"`     // subroute nested routes
+    Handler         string        `json:"handler"`                  // "reverse_proxy" | "static_response" | "rewrite" | "subroute" | "file_server" | "headers"
+    Upstreams       []Upstream    `json:"upstreams,omitempty"`      // reverse_proxy
+    Headers         *HeaderPolicy `json:"headers,omitempty"`        // custom MarshalJSON per handler (see Gotchas); rejected for file_server
+    StatusCode      int           `json:"status_code,omitempty"`    // static_response
+    Body            string        `json:"body,omitempty"`           // static_response
+    URI             string        `json:"uri,omitempty"`            // rewrite setter
+    StripPathPrefix string        `json:"strip_path_prefix,omitempty"` // rewrite prefix strip
+    StripPathSuffix string        `json:"strip_path_suffix,omitempty"` // rewrite suffix strip
+    Method          string        `json:"method,omitempty"`         // rewrite method
+    URISubstring    []URISubst    `json:"uri_substring,omitempty"`  // rewrite substring replace
+    Root            string        `json:"root,omitempty"`           // file_server
+    Hide            []string      `json:"hide,omitempty"`           // file_server hide patterns
+    IndexNames      []string      `json:"index_names,omitempty"`    // file_server index file names
+    Browse          *Browse       `json:"browse,omitempty"`         // file_server directory browsing
+    Routes          []Route       `json:"routes,omitempty"`         // subroute nested routes
 }
 ```
+
+Fields are validated against a built-in schema registry at marshal time — setting a field a handler doesn't support returns an error. Call `RegisterHandlerFields` to extend the registry for custom/third-party modules.
 
 ### HeaderPolicy
 
@@ -163,9 +171,23 @@ type HeaderPolicy struct {
 }
 
 type HeaderOps struct {
-    Add    map[string][]string `json:"add,omitempty"`
-    Set    map[string][]string `json:"set,omitempty"`
-    Delete []string            `json:"delete,omitempty"`
+    Add     map[string][]string        `json:"add,omitempty"`
+    Set     map[string][]string        `json:"set,omitempty"`
+    Delete  []string                   `json:"delete,omitempty"`
+    Replace map[string][]Replacement   `json:"replace,omitempty"`
+    Require *ResponseMatcher           `json:"require,omitempty"`  // response-only
+    Deferred bool                      `json:"deferred,omitempty"`  // response-only
+}
+
+type Replacement struct {
+    Search       string `json:"search,omitempty"`
+    SearchRegexp string `json:"search_regexp,omitempty"`
+    Replace      string `json:"replace,omitempty"`
+}
+
+type ResponseMatcher struct {
+    StatusCode []int               `json:"status_code,omitempty"`
+    Headers    map[string][]string `json:"headers,omitempty"`
 }
 ```
 
@@ -247,11 +269,16 @@ The admin endpoint does not support HTTP/2. The client explicitly sets `ForceAtt
 
 The `Handler.Headers` field marshals differently depending on `Handler.Handler`:
 
+- **`reverse_proxy`**: headers marshal as the nested `HeaderPolicy` object under a `"headers"` key (`{"headers": {"request": {...}, "response": {...}}}`).
+- **`headers` (standalone)**: request/response emit flattened at the handler top level (`{"request": {...}, "response": {...}}`), NOT nested under a `"headers"` key.
 - **`static_response`**: headers marshal as a flat `map[string][]string` (http.Header shape). Add/Delete/Request sub-fields are rejected with an error.
-- **`file_server`**: rejected entirely — Caddy's `file_server` module has no `headers` field, so setting `Headers` returns an error instead of emitting config the admin API would reject with HTTP 400.
-- **All other modules** (`reverse_proxy`, `rewrite`, etc.): headers marshal as the full nested `HeaderPolicy` object (`{request: ..., response: ...}`).
+- **`file_server`**: rejected entirely — Caddy's `file_server` module has no `headers` field. Setting `Headers` returns an error.
 
-The `file_server` handler emits flat `root` and `strip_path_prefix` string fields (both optional via `omitempty`).
+### 4b. Field Schema Validation
+
+`MarshalJSON` validates every handler field against a built-in schema registry before emitting JSON. Setting a field a handler doesn't support (e.g. `StripPathPrefix` on `file_server`) returns an error instead of emitting config Caddy would silently ignore. Register third-party modules via `RegisterHandlerFields`.
+
+The `file_server` handler uses its _real_ Caddy fields: `root` (directory), `hide` (glob patterns), `index_names`, and `browse`. Prefix stripping belongs to the **`rewrite`** handler (`strip_path_prefix` / `strip_path_suffix`), which also supports `uri`, `uri_substring`, and `method`.
 
 ### 5. AdminConfig.Validate() — Loopback-Only Admin
 
