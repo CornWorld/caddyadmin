@@ -57,14 +57,18 @@ type RemoteIPMatch struct {
 }
 
 // Handler defines a single Caddy handler. Different handler types use different fields.
+//
+// Fields are validated against the handler schema at marshal time; setting a field
+// that a handler doesn't support returns an error. To register fields for custom or
+// third-party handler modules, use RegisterHandlerFields.
 type Handler struct {
-	// Handler is the module name: "reverse_proxy", "static_response", "rewrite", "subroute", "file_server", etc.
+	// Handler is the module name: "reverse_proxy", "static_response", "rewrite", "subroute", "file_server", "headers", etc.
 	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/handler
 	Handler string `json:"handler"`
 
 	// --- reverse_proxy / static_response shared ---
 
-	// Upstreams is the list of upstream backends.
+	// Upstreams is the list of upstream backends (reverse_proxy).
 	Upstreams []Upstream `json:"upstreams,omitempty"`
 
 	// Headers is request/response header manipulation for reverse_proxy,
@@ -72,11 +76,11 @@ type Handler struct {
 	//
 	// In-memory representation is always *HeaderPolicy, but the on-wire JSON
 	// shape differs per handler (verified against Caddy 2.8 admin API):
-	//   - reverse_proxy / standalone `headers` handler → nested HeaderPolicy
-	//     shape ({request:{...}, response:{...}}). Required.
-	//   - static_response → flat http.Header shape (map[string][]string).
-	//     Caddy rejects the nested shape with HTTP 400. MarshalJSON on Handler
-	//     flattens Response.Set for this handler kind only.
+	//   - reverse_proxy → nested at "headers" key ({request:{...}, response:{...}})
+	//   - standalone `headers` handler → flattened at top level (request:/response:)
+	//   - static_response → flat http.Header shape (map[string][]string); Caddy rejects
+	//     the nested shape with HTTP 400
+	//   - file_server → rejected entirely (Caddy's file_server has no headers field)
 	Headers *HeaderPolicy `json:"headers,omitempty"`
 
 	// --- static_response fields ---
@@ -89,19 +93,44 @@ type Handler struct {
 
 	// --- rewrite fields ---
 
-	// URI for rewrite: strips/sets the request URI.
-	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/uri
+	// URI sets or rewrites the request URI (path + query).
+	// Accepts placeholders: "/foo", "?{http.request.uri.query}&a=b", etc.
+	// See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/rewrite
 	URI string `json:"uri,omitempty"`
+
+	// StripPathPrefix strips the given prefix from the beginning of the URI path.
+	// Default comparison is in normalized (unescaped) space.
+	// See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/rewrite
+	StripPathPrefix string `json:"strip_path_prefix,omitempty"`
+
+	// StripPathSuffix strips the given suffix from the end of the URI path.
+	// See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/rewrite
+	StripPathSuffix string `json:"strip_path_suffix,omitempty"`
+
+	// Method changes the request's HTTP verb (rewrite).
+	Method string `json:"method,omitempty"`
+
+	// URISubstring performs substring replacements on the URI (rewrite).
+	URISubstring []URISubst `json:"uri_substring,omitempty"`
 
 	// --- file_server fields ---
 
 	// Root is the directory file_server serves files from.
-	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/file_server
+	// The request path is joined to this root after any upstream rewrite.
+	// See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/file_server
 	Root string `json:"root,omitempty"`
 
-	// StripPathPrefix is the URL prefix stripped from the request path before
-	// mapping it to the filesystem. Optional; omitted when empty.
-	StripPathPrefix string `json:"strip_path_prefix,omitempty"`
+	// Hide is a list of files or folders to hide; file_server pretends they
+	// don't exist. Accepts glob patterns like "*.ext" or "/foo/*/bar" and
+	// placeholders. Uses filesystem paths, not request paths.
+	Hide []string `json:"hide,omitempty"`
+
+	// IndexNames is the list of index files to try when a directory is requested.
+	// Default: index.html, index.txt.
+	IndexNames []string `json:"index_names,omitempty"`
+
+	// Browse enables directory listings when no index file exists.
+	Browse *Browse `json:"browse,omitempty"`
 
 	// --- general fields ---
 
@@ -122,11 +151,43 @@ type HeaderPolicy struct {
 	Response *HeaderOps `json:"response,omitempty"`
 }
 
-// HeaderOps defines header add/delete/set operations.
+// HeaderOps defines request and response header operations.
+// See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/headers
 type HeaderOps struct {
-	Add    map[string][]string `json:"add,omitempty"`
-	Set    map[string][]string `json:"set,omitempty"`
-	Delete []string            `json:"delete,omitempty"`
+	Add    map[string][]string        `json:"add,omitempty"`    // Add headers; does not replace existing.
+	Set    map[string][]string        `json:"set,omitempty"`    // Set headers; replaces existing values.
+	Delete []string                   `json:"delete,omitempty"` // Delete header fields (wildcards supported).
+	Replace map[string][]Replacement  `json:"replace,omitempty"` // In-situ substring replacements.
+	// Response-only fields (ignored for request headers by Caddy):
+	Require  *ResponseMatcher `json:"require,omitempty"` // Defer ops until response matches these criteria.
+	Deferred bool             `json:"deferred,omitempty"` // Defer ops until response headers are written.
+}
+
+// Replacement describes a string replacement in header values.
+type Replacement struct {
+	Search       string `json:"search,omitempty"`        // Substring to find.
+	SearchRegexp string `json:"search_regexp,omitempty"` // Regex to search with.
+	Replace      string `json:"replace,omitempty"`       // Replacement string.
+}
+
+// ResponseMatcher conditions response header operations on status code and/or header values.
+type ResponseMatcher struct {
+	StatusCode []int               `json:"status_code,omitempty"` // Required status codes.
+	Headers    map[string][]string `json:"headers,omitempty"`     // Required header values.
+}
+
+// Browse configures directory browsing for file_server.
+type Browse struct {
+	TemplateFile string   `json:"template_file,omitempty"`
+	Sort         []string `json:"sort,omitempty"`
+	FileLimit    int      `json:"file_limit,omitempty"`
+}
+
+// URISubst describes a substring replacement in the rewrite handler's URI.
+type URISubst struct {
+	Find    string `json:"find,omitempty"`    // Substring to find.
+	Replace string `json:"replace,omitempty"` // Replacement string.
+	Limit   int    `json:"limit,omitempty"`   // Max replacements (0 = unlimited).
 }
 
 // ============================================================
@@ -319,40 +380,193 @@ type Issuer struct {
 }
 
 // ============================================================
+// Handler field schema registry
+// ============================================================
+//
+// Each handler module has a known set of valid top-level JSON fields.
+// Caddy silently ignores unknown fields at the handler level (encoding/json),
+// so emitting an invalid field (e.g. strip_path_prefix on file_server)
+// is a silent misconfiguration. We reject unknown fields at marshal time.
+//
+// Call RegisterHandlerFields to extend this set for custom/third-party modules.
+
+var knownHandlerFields = map[string]map[string]struct{}{
+	"reverse_proxy": {
+		"handler": {}, "upstreams": {}, "headers": {},
+	},
+	"static_response": {
+		"handler": {}, "status_code": {}, "body": {}, "headers": {},
+	},
+	"rewrite": {
+		"handler": {}, "uri": {}, "strip_path_prefix": {}, "strip_path_suffix": {},
+		"uri_substring": {}, "path_regexp": {}, "method": {}, "query": {},
+	},
+	"subroute": {
+		"handler": {}, "routes": {},
+	},
+	"file_server": {
+		"handler": {}, "fs": {}, "root": {}, "hide": {}, "index_names": {},
+		"browse": {}, "canonical_uris": {}, "status_code": {},
+		"pass_thru": {}, "precompressed": {}, "precompressed_order": {},
+		"etag_file_extensions": {},
+	},
+	"headers": {
+		"handler": {}, "request": {}, "response": {},
+	},
+	"vars": {
+		"handler": {},
+	},
+}
+
+// RegisterHandlerFields registers (or extends) the known JSON field set for a
+// handler module. Use this for custom Caddy builds with third-party modules
+// whose fields are not in the built-in registry.
+//
+// The handler name should match the admin API module name (e.g. "cache").
+// Fields is the list of valid top-level JSON keys for that module.
+func RegisterHandlerFields(handler string, fields []string) {
+	if _, ok := knownHandlerFields[handler]; !ok {
+		knownHandlerFields[handler] = make(map[string]struct{}, len(fields))
+	}
+	for _, f := range fields {
+		knownHandlerFields[handler][f] = struct{}{}
+	}
+}
+
+// HandlerFieldSet returns the known JSON field set for a handler module.
+// Returns nil if the handler is completely unknown (unregistered).
+func HandlerFieldSet(handler string) map[string]struct{} {
+	return knownHandlerFields[handler]
+}
+
+// Validate checks that all non-zero fields on this Handler are valid for its
+// handler module. Returns an error for fields Caddy would silently ignore.
+// MarshalJSON calls Validate automatically; call it explicitly to fail early
+// before building large config trees.
+func (h Handler) Validate() error {
+	if h.Handler == "" {
+		return fmt.Errorf("caddyadmin: Handler.Handler is required")
+	}
+	fields := HandlerFieldSet(h.Handler)
+	if fields == nil {
+		return fmt.Errorf("caddyadmin: unknown handler module %q — register fields with RegisterHandlerFields", h.Handler)
+	}
+
+	check := func(fieldName string, set bool) error {
+		if set {
+			if _, ok := fields[fieldName]; !ok {
+				return fmt.Errorf("caddyadmin: handler %q has no field %q", h.Handler, fieldName)
+			}
+		}
+		return nil
+	}
+
+	if err := check("upstreams", len(h.Upstreams) > 0); err != nil {
+		return err
+	}
+	if err := check("status_code", h.StatusCode != 0); err != nil {
+		return err
+	}
+	if err := check("body", h.Body != ""); err != nil {
+		return err
+	}
+	if err := check("uri", h.URI != ""); err != nil {
+		return err
+	}
+	if err := check("strip_path_prefix", h.StripPathPrefix != ""); err != nil {
+		return err
+	}
+	if err := check("strip_path_suffix", h.StripPathSuffix != ""); err != nil {
+		return err
+	}
+	if err := check("uri_substring", len(h.URISubstring) > 0); err != nil {
+		return err
+	}
+	if err := check("method", h.Method != ""); err != nil {
+		return err
+	}
+	if err := check("root", h.Root != ""); err != nil {
+		return err
+	}
+	if err := check("hide", len(h.Hide) > 0); err != nil {
+		return err
+	}
+	if err := check("index_names", len(h.IndexNames) > 0); err != nil {
+		return err
+	}
+	if err := check("browse", h.Browse != nil); err != nil {
+		return err
+	}
+	if err := check("routes", len(h.Routes) > 0); err != nil {
+		return err
+	}
+
+	// Headers: validated separately per-handler in MarshalJSON
+	if h.Headers != nil {
+		switch h.Handler {
+		case "file_server":
+			return fmt.Errorf("caddyadmin: file_server handler does not support headers")
+		case "headers":
+			// ok — emitted flattened at top level
+		default:
+			if _, ok := fields["headers"]; !ok {
+				return fmt.Errorf("caddyadmin: handler %q has no field %q", h.Handler, "headers")
+			}
+		}
+	}
+
+	return nil
+}
+
+// ============================================================
 // Custom marshaling
 // ============================================================
 
 // handlerRaw is the default marshal output of Handler with the Headers field
 // omitted. MarshalJSON fills Headers separately depending on Handler kind.
 type handlerRaw struct {
-	Handler         string     `json:"handler"`
-	Upstreams       []Upstream `json:"upstreams,omitempty"`
-	StatusCode      int        `json:"status_code,omitempty"`
-	Body            string     `json:"body,omitempty"`
-	URI             string     `json:"uri,omitempty"`
-	Routes          []Route    `json:"routes,omitempty"`
-	Root            string     `json:"root,omitempty"`
-	StripPathPrefix string     `json:"strip_path_prefix,omitempty"`
+	Handler         string      `json:"handler"`
+	Upstreams       []Upstream  `json:"upstreams,omitempty"`
+	StatusCode      int         `json:"status_code,omitempty"`
+	Body            string      `json:"body,omitempty"`
+	URI             string      `json:"uri,omitempty"`
+	StripPathPrefix string      `json:"strip_path_prefix,omitempty"`
+	StripPathSuffix string      `json:"strip_path_suffix,omitempty"`
+	Method          string      `json:"method,omitempty"`
+	URISubstring    []URISubst  `json:"uri_substring,omitempty"`
+	Root            string      `json:"root,omitempty"`
+	Hide            []string    `json:"hide,omitempty"`
+	IndexNames      []string    `json:"index_names,omitempty"`
+	Browse          *Browse     `json:"browse,omitempty"`
+	Routes          []Route     `json:"routes,omitempty"`
 }
 
-// MarshalJSON serializes Handler. Headers are emitted per-handler:
+// MarshalJSON serializes Handler. Fields are validated against the handler
+// schema (Validate) before marshaling. Headers are emitted per-handler:
+//   - reverse_proxy → nested at "headers" key ({request:{...}, response:{...}})
+//   - standalone `headers` handler → flattened at top level (request:/response:)
 //   - static_response → flat map[string][]string (http.Header shape)
-//   - all other modules → nested HeaderPolicy shape
-//
-// file_server rejects Headers entirely: Caddy's file_server module has no
-// `headers` field, so setting one would emit config the admin API rejects.
-// This matches Caddy 2.x's per-handler schema — see
-// https://caddyserver.com/docs/json/apps/http/servers/routes/handle/
+//   - file_server → rejected entirely
 func (h Handler) MarshalJSON() ([]byte, error) {
+	if err := h.Validate(); err != nil {
+		return nil, err
+	}
+
 	raw := handlerRaw{
 		Handler:         h.Handler,
 		Upstreams:       h.Upstreams,
 		StatusCode:      h.StatusCode,
 		Body:            h.Body,
 		URI:             h.URI,
-		Routes:          h.Routes,
-		Root:            h.Root,
 		StripPathPrefix: h.StripPathPrefix,
+		StripPathSuffix: h.StripPathSuffix,
+		Method:          h.Method,
+		URISubstring:    h.URISubstring,
+		Root:            h.Root,
+		Hide:            h.Hide,
+		IndexNames:      h.IndexNames,
+		Browse:          h.Browse,
+		Routes:          h.Routes,
 	}
 
 	if h.Headers == nil {
@@ -360,8 +574,7 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 	}
 
 	if h.Handler == "file_server" {
-		// Caddy's file_server module has no `headers` field — emitting one
-		// would be rejected by the admin API with HTTP 400. Fail fast.
+		// Already validated above, but re-check for safety.
 		return nil, fmt.Errorf("caddyadmin: file_server handler does not support headers")
 	}
 
@@ -416,14 +629,32 @@ func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
 	if raw.URI != "" {
 		m["uri"] = raw.URI
 	}
-	if raw.Routes != nil {
-		m["routes"] = raw.Routes
+	if raw.StripPathPrefix != "" {
+		m["strip_path_prefix"] = raw.StripPathPrefix
+	}
+	if raw.StripPathSuffix != "" {
+		m["strip_path_suffix"] = raw.StripPathSuffix
+	}
+	if raw.Method != "" {
+		m["method"] = raw.Method
+	}
+	if raw.URISubstring != nil {
+		m["uri_substring"] = raw.URISubstring
 	}
 	if raw.Root != "" {
 		m["root"] = raw.Root
 	}
-	if raw.StripPathPrefix != "" {
-		m["strip_path_prefix"] = raw.StripPathPrefix
+	if raw.Hide != nil {
+		m["hide"] = raw.Hide
+	}
+	if raw.IndexNames != nil {
+		m["index_names"] = raw.IndexNames
+	}
+	if raw.Browse != nil {
+		m["browse"] = raw.Browse
+	}
+	if raw.Routes != nil {
+		m["routes"] = raw.Routes
 	}
 	return json.Marshal(m)
 }
@@ -470,6 +701,24 @@ func (h *Handler) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := decode("strip_path_prefix", &h.StripPathPrefix); err != nil {
+		return err
+	}
+	if err := decode("strip_path_suffix", &h.StripPathSuffix); err != nil {
+		return err
+	}
+	if err := decode("method", &h.Method); err != nil {
+		return err
+	}
+	if err := decode("uri_substring", &h.URISubstring); err != nil {
+		return err
+	}
+	if err := decode("hide", &h.Hide); err != nil {
+		return err
+	}
+	if err := decode("index_names", &h.IndexNames); err != nil {
+		return err
+	}
+	if err := decode("browse", &h.Browse); err != nil {
 		return err
 	}
 
