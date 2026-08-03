@@ -321,25 +321,39 @@ func TestAdminConfigValidateRejectsNonLoopbackListen(t *testing.T) {
 }
 
 // TestFileServerHandlerMarshal verifies the file_server handler serializes
-// root and strip_path_prefix as flat Caddy fields — exactly the shape Caddy's
-// file_server module expects (no nested Headers object). Mirrors the target
-// shape vanblog emits for theme static assets.
+// its real Caddy fields (root, hide, index_names) as flat fields — no nested
+// Headers object, no strip_path_prefix (which belongs to rewrite, not file_server).
+// Mirrors the shape Caddy's file_server module actually expects.
 func TestFileServerHandlerMarshal(t *testing.T) {
 	fs := Handler{
-		Handler:         "file_server",
-		Root:            "/var/lib/vanblog/themes/base/dist/client",
-		StripPathPrefix: "/themes/base",
+		Handler:    "file_server",
+		Root:       "/var/lib/vanblog/themes/base/dist/client",
+		Hide:       []string{"./CaddyfileTemplate", "*.secret"},
+		IndexNames: []string{"index.html", "index.htm"},
 	}
 	data, err := json.Marshal(fs)
 	if err != nil {
 		t.Fatalf("marshal file_server: %v", err)
 	}
-	want := `{"handler":"file_server","root":"/var/lib/vanblog/themes/base/dist/client","strip_path_prefix":"/themes/base"}`
-	if string(data) != want {
-		t.Fatalf("file_server JSON mismatch:\n got: %s\nwant: %s", string(data), want)
-	}
 	if strings.Contains(string(data), "headers") {
 		t.Fatalf("file_server must not emit a headers key: %s", string(data))
+	}
+	if strings.Contains(string(data), "strip_path_prefix") {
+		t.Fatalf("file_server must NOT emit strip_path_prefix (belongs to rewrite): %s", string(data))
+	}
+	// Round-trip
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal file_server: %v", err)
+	}
+	if back.Root != fs.Root {
+		t.Fatalf("root mismatch: %s != %s", back.Root, fs.Root)
+	}
+	if len(back.Hide) != 2 || back.Hide[0] != "./CaddyfileTemplate" || back.Hide[1] != "*.secret" {
+		t.Fatalf("hide mismatch: %v", back.Hide)
+	}
+	if len(back.IndexNames) != 2 {
+		t.Fatalf("index_names mismatch: %v", back.IndexNames)
 	}
 }
 
@@ -368,9 +382,10 @@ func TestFileServerHandlerMarshalNoStrip(t *testing.T) {
 // strip_path_prefix (mirrors TestHandlerUnmarshalJSONRoundTrip).
 func TestFileServerHandlerUnmarshalJSONRoundTrip(t *testing.T) {
 	fs := Handler{
-		Handler:         "file_server",
-		Root:            "/var/lib/vanblog/themes/base/dist/client",
-		StripPathPrefix: "/themes/base",
+		Handler:    "file_server",
+		Root:       "/var/lib/vanblog/themes/base/dist/client",
+		Hide:       []string{"secret/*"},
+		IndexNames: []string{"index.html"},
 	}
 	data, err := json.Marshal(fs)
 	if err != nil {
@@ -380,8 +395,11 @@ func TestFileServerHandlerUnmarshalJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &back); err != nil {
 		t.Fatalf("unmarshal file_server: %v", err)
 	}
-	if back.Handler != "file_server" || back.Root != fs.Root || back.StripPathPrefix != fs.StripPathPrefix {
+	if back.Handler != "file_server" || back.Root != fs.Root {
 		t.Fatalf("file_server fields lost in round-trip: %+v", back)
+	}
+	if len(back.Hide) != 1 || back.Hide[0] != "secret/*" {
+		t.Fatalf("hide lost in round-trip: %v", back.Hide)
 	}
 }
 
@@ -434,6 +452,16 @@ func TestExistingHandlerTypesUnchanged(t *testing.T) {
 			},
 			want: `{"handler":"subroute","routes":[{"handle":[{"handler":"static_response","status_code":200,"body":"ok"}]}]}`,
 		},
+		{
+			name: "headers_standalone_flattened",
+			h: Handler{
+				Handler: "headers",
+				Headers: &HeaderPolicy{
+					Response: &HeaderOps{Set: map[string][]string{"Cache-Control": {"no-store"}}},
+				},
+			},
+			want: `{"handler":"headers","response":{"set":{"Cache-Control":["no-store"]}}}`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -445,5 +473,163 @@ func TestExistingHandlerTypesUnchanged(t *testing.T) {
 				t.Fatalf("%s JSON mismatch:\n got: %s\nwant: %s", tc.name, string(data), tc.want)
 			}
 		})
+	}
+}
+
+// TestHeadersHandlerMarshal verifies the standalone `headers` handler emits
+// request/response at the handler top level (flattened), NOT under a `headers`
+// key like reverse_proxy. This is the regression test for the flattening bug.
+func TestHeadersHandlerMarshal(t *testing.T) {
+	h := Handler{
+		Handler: "headers",
+		Headers: &HeaderPolicy{
+			Request:  &HeaderOps{Set: map[string][]string{"X-Client": {"caddy"}}},
+			Response: &HeaderOps{Add: map[string][]string{"Server": {"caddy"}}, Delete: []string{"X-Powered-By"}},
+		},
+	}
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal headers: %v", err)
+	}
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, `"headers":`) {
+		t.Fatalf("standalone headers handler must NOT emit nested 'headers' key — request/response must be at top level: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"request":`) {
+		t.Fatalf("standalone headers handler must emit 'request' at top level: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"response":`) {
+		t.Fatalf("standalone headers handler must emit 'response' at top level: %s", jsonStr)
+	}
+}
+
+// TestHeadersHandlerUnmarshalJSONRoundTrip verifies the standalone `headers`
+// handler round-trips through MarshalJSON/UnmarshalJSON — request/response at
+// top level is decoded back into Headers correctly.
+func TestHeadersHandlerUnmarshalJSONRoundTrip(t *testing.T) {
+	h := Handler{
+		Handler: "headers",
+		Headers: &HeaderPolicy{
+			Response: &HeaderOps{
+				Set:      map[string][]string{"Cache-Control": {"public, max-age=3600"}},
+				Deferred: true,
+			},
+		},
+	}
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal headers: %v", err)
+	}
+	t.Logf("headers JSON: %s", data)
+
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal headers: %v", err)
+	}
+	if back.Headers == nil || back.Headers.Response == nil {
+		t.Fatalf("headers lost in round-trip: %+v", back.Headers)
+	}
+	if back.Headers.Response.Set["Cache-Control"][0] != "public, max-age=3600" {
+		t.Fatalf("Cache-Control lost: %+v", back.Headers.Response.Set)
+	}
+	if !back.Headers.Response.Deferred {
+		t.Fatalf("deferred not round-tripped: %+v", back.Headers.Response)
+	}
+}
+
+// TestRewriteStripPathPrefix verifies the rewrite handler correctly serializes
+// strip_path_prefix (the field previously wrongly placed on file_server).
+func TestRewriteStripPathPrefix(t *testing.T) {
+	rw := Handler{
+		Handler:         "rewrite",
+		StripPathPrefix: "/api",
+		StripPathSuffix: ".html",
+		Method:          "POST",
+		URISubstring:    []URISubst{{Find: "/old", Replace: "/new", Limit: 1}},
+	}
+	data, err := json.Marshal(rw)
+	if err != nil {
+		t.Fatalf("marshal rewrite: %v", err)
+	}
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"strip_path_prefix":"/api"`) {
+		t.Fatalf("rewrite must emit strip_path_prefix: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"strip_path_suffix":".html"`) {
+		t.Fatalf("rewrite must emit strip_path_suffix: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"method":"POST"`) {
+		t.Fatalf("rewrite must emit method: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"uri_substring"`) {
+		t.Fatalf("rewrite must emit uri_substring: %s", jsonStr)
+	}
+
+	// Round-trip
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal rewrite: %v", err)
+	}
+	if back.StripPathPrefix != "/api" || back.StripPathSuffix != ".html" || back.Method != "POST" {
+		t.Fatalf("rewrite fields lost: %+v", back)
+	}
+	if len(back.URISubstring) != 1 || back.URISubstring[0].Find != "/old" {
+		t.Fatalf("uri_substring lost: %+v", back.URISubstring)
+	}
+}
+
+// TestValidateRejectsInvalidField verifies that Validate (and therefore
+// MarshalJSON) rejects fields that don't belong to the handler.
+func TestValidateRejectsInvalidField(t *testing.T) {
+	// strip_path_prefix on file_server — the original bug this fixes
+	fs := Handler{
+		Handler:         "file_server",
+		Root:            "/tmp",
+		StripPathPrefix: "/themes/base",
+	}
+	if _, err := json.Marshal(fs); err == nil {
+		t.Fatal("file_server with strip_path_prefix must be rejected by Validate")
+	}
+	if !strings.Contains(errToString(fs), "file_server") && !strings.Contains(errToString(fs), "strip_path_prefix") {
+		t.Fatalf("expected error about file_server + strip_path_prefix, got: %v", errToString(fs))
+	}
+
+	// upstreams on file_server
+	fs2 := Handler{Handler: "file_server", Root: "/tmp", Upstreams: []Upstream{{Dial: "127.0.0.1:80"}}}
+	if _, err := json.Marshal(fs2); err == nil {
+		t.Fatal("file_server with upstreams must be rejected")
+	}
+
+	// unknown handler
+	unk := Handler{Handler: "unknown_module", Root: "/tmp"}
+	if _, err := json.Marshal(unk); err == nil {
+		t.Fatal("unknown handler must be rejected")
+	}
+}
+
+// errToString marshals h and returns the error string, or "<no error>" if nil.
+func errToString(h Handler) string {
+	_, err := json.Marshal(h)
+	if err != nil {
+		return err.Error()
+	}
+	return "<no error>"
+}
+
+// TestRegisterHandlerFields verifies extension registration works.
+func TestRegisterHandlerFields(t *testing.T) {
+	// Register a third-party handler
+	RegisterHandlerFields("cache", []string{"handler", "default_max_age", "cache_key"})
+
+	// Now this should validate
+	h := Handler{Handler: "cache"}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("registered handler failed validate: %v", err)
+	}
+
+	// But unexpected fields should still be rejected
+	h.Root = "/tmp"
+	if err := h.Validate(); err == nil {
+		t.Fatal("cache handler with root should be rejected")
 	}
 }
