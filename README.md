@@ -142,13 +142,15 @@ type MatchRule struct {
 
 ```go
 type Handler struct {
-    Handler    string        `json:"handler"`             // "reverse_proxy" | "static_response" | "rewrite" | "subroute"
-    Upstreams  []Upstream    `json:"upstreams,omitempty"`
-    Headers    *HeaderPolicy `json:"headers,omitempty"`    // custom MarshalJSON (see Gotchas)
-    StatusCode int           `json:"status_code,omitempty"`
-    Body       string        `json:"body,omitempty"`
-    URI        string        `json:"uri,omitempty"`
-    Routes     []Route       `json:"routes,omitempty"`     // subroute nested routes
+    Handler         string        `json:"handler"`             // "reverse_proxy" | "static_response" | "rewrite" | "subroute" | "file_server"
+    Upstreams       []Upstream    `json:"upstreams,omitempty"`
+    Headers         *HeaderPolicy `json:"headers,omitempty"`    // custom MarshalJSON (see Gotchas); rejected for file_server
+    StatusCode      int           `json:"status_code,omitempty"`
+    Body            string        `json:"body,omitempty"`
+    URI             string        `json:"uri,omitempty"`
+    Root            string        `json:"root,omitempty"`       // file_server root directory
+    StripPathPrefix string        `json:"strip_path_prefix,omitempty"` // file_server URL prefix to strip (optional)
+    Routes          []Route       `json:"routes,omitempty"`     // subroute nested routes
 }
 ```
 
@@ -246,7 +248,10 @@ The admin endpoint does not support HTTP/2. The client explicitly sets `ForceAtt
 The `Handler.Headers` field marshals differently depending on `Handler.Handler`:
 
 - **`static_response`**: headers marshal as a flat `map[string][]string` (http.Header shape). Add/Delete/Request sub-fields are rejected with an error.
+- **`file_server`**: rejected entirely — Caddy's `file_server` module has no `headers` field, so setting `Headers` returns an error instead of emitting config the admin API would reject with HTTP 400.
 - **All other modules** (`reverse_proxy`, `rewrite`, etc.): headers marshal as the full nested `HeaderPolicy` object (`{request: ..., response: ...}`).
+
+The `file_server` handler emits flat `root` and `strip_path_prefix` string fields (both optional via `omitempty`).
 
 ### 5. AdminConfig.Validate() — Loopback-Only Admin
 

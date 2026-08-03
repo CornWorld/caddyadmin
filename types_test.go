@@ -319,3 +319,131 @@ func TestAdminConfigValidateRejectsNonLoopbackListen(t *testing.T) {
 		t.Fatal("Validate() must still reject wildcard origins")
 	}
 }
+
+// TestFileServerHandlerMarshal verifies the file_server handler serializes
+// root and strip_path_prefix as flat Caddy fields — exactly the shape Caddy's
+// file_server module expects (no nested Headers object). Mirrors the target
+// shape vanblog emits for theme static assets.
+func TestFileServerHandlerMarshal(t *testing.T) {
+	fs := Handler{
+		Handler:         "file_server",
+		Root:            "/var/lib/vanblog/themes/base/dist/client",
+		StripPathPrefix: "/themes/base",
+	}
+	data, err := json.Marshal(fs)
+	if err != nil {
+		t.Fatalf("marshal file_server: %v", err)
+	}
+	want := `{"handler":"file_server","root":"/var/lib/vanblog/themes/base/dist/client","strip_path_prefix":"/themes/base"}`
+	if string(data) != want {
+		t.Fatalf("file_server JSON mismatch:\n got: %s\nwant: %s", string(data), want)
+	}
+	if strings.Contains(string(data), "headers") {
+		t.Fatalf("file_server must not emit a headers key: %s", string(data))
+	}
+}
+
+// TestFileServerHandlerMarshalNoStrip verifies file_server with only root
+// (admin static assets) omits strip_path_prefix entirely (omitempty).
+func TestFileServerHandlerMarshalNoStrip(t *testing.T) {
+	fs := Handler{
+		Handler: "file_server",
+		Root:    "/app/admin/dist/client",
+	}
+	data, err := json.Marshal(fs)
+	if err != nil {
+		t.Fatalf("marshal file_server: %v", err)
+	}
+	want := `{"handler":"file_server","root":"/app/admin/dist/client"}`
+	if string(data) != want {
+		t.Fatalf("file_server JSON mismatch:\n got: %s\nwant: %s", string(data), want)
+	}
+	if strings.Contains(string(data), "strip_path_prefix") {
+		t.Fatalf("strip_path_prefix must be omitted when empty: %s", string(data))
+	}
+}
+
+// TestFileServerHandlerUnmarshalJSONRoundTrip verifies a file_server handler
+// round-trips through MarshalJSON/UnmarshalJSON without losing root or
+// strip_path_prefix (mirrors TestHandlerUnmarshalJSONRoundTrip).
+func TestFileServerHandlerUnmarshalJSONRoundTrip(t *testing.T) {
+	fs := Handler{
+		Handler:         "file_server",
+		Root:            "/var/lib/vanblog/themes/base/dist/client",
+		StripPathPrefix: "/themes/base",
+	}
+	data, err := json.Marshal(fs)
+	if err != nil {
+		t.Fatalf("marshal file_server: %v", err)
+	}
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal file_server: %v", err)
+	}
+	if back.Handler != "file_server" || back.Root != fs.Root || back.StripPathPrefix != fs.StripPathPrefix {
+		t.Fatalf("file_server fields lost in round-trip: %+v", back)
+	}
+}
+
+// TestFileServerRejectsHeaders pins the contract that file_server cannot carry
+// a Headers policy: Caddy's file_server module has no `headers` field, so any
+// shape (nested or flat) would be rejected by the admin API with HTTP 400.
+// We fail fast instead of emitting config Caddy would reject.
+func TestFileServerRejectsHeaders(t *testing.T) {
+	fs := Handler{
+		Handler: "file_server",
+		Root:    "/app/admin/dist/client",
+		Headers: &HeaderPolicy{
+			Response: &HeaderOps{Set: map[string][]string{"X-Foo": {"bar"}}},
+		},
+	}
+	if _, err := json.Marshal(fs); err == nil {
+		t.Fatal("file_server with Headers must be rejected")
+	}
+}
+
+// TestExistingHandlerTypesUnchanged pins the exact JSON output of the
+// pre-existing handler kinds so future changes to MarshalJSON cannot silently
+// alter their on-wire shape (regression guard for backward compatibility).
+func TestExistingHandlerTypesUnchanged(t *testing.T) {
+	cases := []struct {
+		name string
+		h    Handler
+		want string
+	}{
+		{
+			name: "reverse_proxy",
+			h:    Handler{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "127.0.0.1:8090"}}},
+			want: `{"handler":"reverse_proxy","upstreams":[{"dial":"127.0.0.1:8090"}]}`,
+		},
+		{
+			name: "static_response",
+			h:    Handler{Handler: "static_response", StatusCode: 200, Body: "ok"},
+			want: `{"handler":"static_response","status_code":200,"body":"ok"}`,
+		},
+		{
+			name: "rewrite",
+			h:    Handler{Handler: "rewrite", URI: "/foo"},
+			want: `{"handler":"rewrite","uri":"/foo"}`,
+		},
+		{
+			name: "subroute",
+			h: Handler{
+				Handler: "subroute",
+				Routes:  []Route{{Handle: []Handler{{Handler: "static_response", StatusCode: 200, Body: "ok"}}}},
+			},
+			want: `{"handler":"subroute","routes":[{"handle":[{"handler":"static_response","status_code":200,"body":"ok"}]}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.h)
+			if err != nil {
+				t.Fatalf("marshal %s: %v", tc.name, err)
+			}
+			if string(data) != tc.want {
+				t.Fatalf("%s JSON mismatch:\n got: %s\nwant: %s", tc.name, string(data), tc.want)
+			}
+		})
+	}
+}

@@ -58,7 +58,7 @@ type RemoteIPMatch struct {
 
 // Handler defines a single Caddy handler. Different handler types use different fields.
 type Handler struct {
-	// Handler is the module name: "reverse_proxy", "static_response", "rewrite", "subroute", etc.
+	// Handler is the module name: "reverse_proxy", "static_response", "rewrite", "subroute", "file_server", etc.
 	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/handler
 	Handler string `json:"handler"`
 
@@ -92,6 +92,16 @@ type Handler struct {
 	// URI for rewrite: strips/sets the request URI.
 	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/uri
 	URI string `json:"uri,omitempty"`
+
+	// --- file_server fields ---
+
+	// Root is the directory file_server serves files from.
+	// See: https://caddyserver.com/docs/json/apps/http/#servers/routes/handle/file_server
+	Root string `json:"root,omitempty"`
+
+	// StripPathPrefix is the URL prefix stripped from the request path before
+	// mapping it to the filesystem. Optional; omitted when empty.
+	StripPathPrefix string `json:"strip_path_prefix,omitempty"`
 
 	// --- general fields ---
 
@@ -315,31 +325,44 @@ type Issuer struct {
 // handlerRaw is the default marshal output of Handler with the Headers field
 // omitted. MarshalJSON fills Headers separately depending on Handler kind.
 type handlerRaw struct {
-	Handler    string     `json:"handler"`
-	Upstreams  []Upstream `json:"upstreams,omitempty"`
-	StatusCode int        `json:"status_code,omitempty"`
-	Body       string     `json:"body,omitempty"`
-	URI        string     `json:"uri,omitempty"`
-	Routes     []Route    `json:"routes,omitempty"`
+	Handler         string     `json:"handler"`
+	Upstreams       []Upstream `json:"upstreams,omitempty"`
+	StatusCode      int        `json:"status_code,omitempty"`
+	Body            string     `json:"body,omitempty"`
+	URI             string     `json:"uri,omitempty"`
+	Routes          []Route    `json:"routes,omitempty"`
+	Root            string     `json:"root,omitempty"`
+	StripPathPrefix string     `json:"strip_path_prefix,omitempty"`
 }
 
-// MarshalJSON serializes Handler. For static_response it emits Headers as a
-// flat map[string][]string (http.Header shape); for every other handler kind
-// it emits Headers as the nested HeaderPolicy shape. This matches Caddy 2.x's
-// per-handler schema — see https://caddyserver.com/docs/json/apps/http/servers/routes/handle/
-// (the two handler modules use different shapes for the same JSON key).
+// MarshalJSON serializes Handler. Headers are emitted per-handler:
+//   - static_response → flat map[string][]string (http.Header shape)
+//   - all other modules → nested HeaderPolicy shape
+//
+// file_server rejects Headers entirely: Caddy's file_server module has no
+// `headers` field, so setting one would emit config the admin API rejects.
+// This matches Caddy 2.x's per-handler schema — see
+// https://caddyserver.com/docs/json/apps/http/servers/routes/handle/
 func (h Handler) MarshalJSON() ([]byte, error) {
 	raw := handlerRaw{
-		Handler:    h.Handler,
-		Upstreams:  h.Upstreams,
-		StatusCode: h.StatusCode,
-		Body:       h.Body,
-		URI:        h.URI,
-		Routes:     h.Routes,
+		Handler:         h.Handler,
+		Upstreams:       h.Upstreams,
+		StatusCode:      h.StatusCode,
+		Body:            h.Body,
+		URI:             h.URI,
+		Routes:          h.Routes,
+		Root:            h.Root,
+		StripPathPrefix: h.StripPathPrefix,
 	}
 
 	if h.Headers == nil {
 		return json.Marshal(raw)
+	}
+
+	if h.Handler == "file_server" {
+		// Caddy's file_server module has no `headers` field — emitting one
+		// would be rejected by the admin API with HTTP 400. Fail fast.
+		return nil, fmt.Errorf("caddyadmin: file_server handler does not support headers")
 	}
 
 	if h.Handler == "static_response" {
@@ -355,6 +378,21 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 			maps.Copy(flat, h.Headers.Response.Set)
 		}
 		return marshalHandlerWithHeaders(raw, flat)
+	}
+	if h.Handler == "headers" {
+		// The standalone `headers` directive carries request/response at the
+		// handler top level, NOT under a `headers` field (unlike reverse_proxy,
+		// whose HeaderPolicy lives at `headers`). Emit them flattened.
+		m := map[string]any{"handler": "headers"}
+		if h.Headers != nil {
+			if h.Headers.Request != nil {
+				m["request"] = h.Headers.Request
+			}
+			if h.Headers.Response != nil {
+				m["response"] = h.Headers.Response
+			}
+		}
+		return json.Marshal(m)
 	}
 	return marshalHandlerWithHeaders(raw, h.Headers)
 }
@@ -380,6 +418,12 @@ func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
 	}
 	if raw.Routes != nil {
 		m["routes"] = raw.Routes
+	}
+	if raw.Root != "" {
+		m["root"] = raw.Root
+	}
+	if raw.StripPathPrefix != "" {
+		m["strip_path_prefix"] = raw.StripPathPrefix
 	}
 	return json.Marshal(m)
 }
@@ -421,6 +465,26 @@ func (h *Handler) UnmarshalJSON(data []byte) error {
 	}
 	if err := decode("routes", &h.Routes); err != nil {
 		return err
+	}
+	if err := decode("root", &h.Root); err != nil {
+		return err
+	}
+	if err := decode("strip_path_prefix", &h.StripPathPrefix); err != nil {
+		return err
+	}
+
+	if h.Handler == "headers" {
+		// The standalone `headers` directive carries request/response at the
+		// handler top level (not under `headers`), mirroring MarshalJSON.
+		hp := &HeaderPolicy{}
+		if err := decode("request", &hp.Request); err != nil {
+			return err
+		}
+		if err := decode("response", &hp.Response); err != nil {
+			return err
+		}
+		h.Headers = hp
+		return nil
 	}
 
 	hdr, ok := raw["headers"]
