@@ -618,6 +618,20 @@ func errToString(h Handler) string {
 
 // TestRegisterHandlerFields verifies extension registration works.
 func TestRegisterHandlerFields(t *testing.T) {
+	// Save the pre-existing registry state and restore it when the test ends
+	// so this test cannot leak a "cache" registration into other tests (the
+	// registry is a package-global shared across tests).
+	orig := HandlerFieldSet("cache")
+	defer func() {
+		handlerFieldsMu.Lock()
+		defer handlerFieldsMu.Unlock()
+		if orig == nil {
+			delete(knownHandlerFields, "cache")
+		} else {
+			knownHandlerFields["cache"] = orig
+		}
+	}()
+
 	// Register a third-party handler
 	RegisterHandlerFields("cache", []string{"handler", "default_max_age", "cache_key"})
 
@@ -631,5 +645,83 @@ func TestRegisterHandlerFields(t *testing.T) {
 	h.Root = "/tmp"
 	if err := h.Validate(); err == nil {
 		t.Fatal("cache handler with root should be rejected")
+	}
+}
+
+// TestStaticResponseRejectsNonSetHeaderOps pins that static_response only
+// supports Response.Set headers: every other header operation must be rejected
+// at marshal time instead of being silently dropped on the wire (Caddy's
+// static_response.headers is a plain http.Header map that cannot express them).
+func TestStaticResponseRejectsNonSetHeaderOps(t *testing.T) {
+	cases := []struct {
+		name string
+		resp *HeaderOps
+	}{
+		{"add", &HeaderOps{Add: map[string][]string{"X-Foo": {"bar"}}}},
+		{"delete", &HeaderOps{Delete: []string{"X-Foo"}}},
+		{"replace", &HeaderOps{Replace: map[string][]Replacement{"x-foo": {{Search: "a", Replace: "b"}}}}},
+		{"require", &HeaderOps{Require: &ResponseMatcher{StatusCode: []int{200}}}},
+		{"deferred", &HeaderOps{Deferred: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := Handler{
+				Handler: "static_response",
+				Body:    "ok",
+				Headers: &HeaderPolicy{Response: tc.resp},
+			}
+			if _, err := json.Marshal(h); err == nil {
+				t.Fatalf("static_response with %s header op must be rejected", tc.name)
+			}
+		})
+	}
+
+	// Response.Set alone (and request headers absence) must still be accepted.
+	h := Handler{
+		Handler: "static_response",
+		Body:    "ok",
+		Headers: &HeaderPolicy{Response: &HeaderOps{Set: map[string][]string{"X-Foo": {"bar"}}}},
+	}
+	if _, err := json.Marshal(h); err != nil {
+		t.Fatalf("static_response with Response.Set must be accepted: %v", err)
+	}
+}
+
+// TestHandlerExtraRoundTrip verifies that fields without a dedicated Go field
+// survive the JSON round-trip via Extra: MarshalJSON emits them and
+// UnmarshalJSON captures them back instead of silently dropping unknown keys.
+func TestHandlerExtraRoundTrip(t *testing.T) {
+	h := Handler{
+		Handler:   "reverse_proxy",
+		Upstreams: []Upstream{{Dial: "127.0.0.1:8090"}},
+		Extra: map[string]any{
+			"load_balancing": map[string]any{"policy": "round_robin"},
+			"cache_key":      "user:{http.request.uri.path}",
+		},
+	}
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal handler with Extra: %v", err)
+	}
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"load_balancing"`) || !strings.Contains(jsonStr, `"cache_key"`) {
+		t.Fatalf("Extra fields not emitted: %s", jsonStr)
+	}
+
+	var back Handler
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal handler with Extra: %v", err)
+	}
+	if len(back.Extra) != 2 || back.Extra["cache_key"] != "user:{http.request.uri.path}" {
+		t.Fatalf("Extra lost in round-trip: %+v", back.Extra)
+	}
+
+	// The round-trip must also re-emit the captured Extra fields identically.
+	reData, err := json.Marshal(back)
+	if err != nil {
+		t.Fatalf("re-marshal handler with Extra: %v", err)
+	}
+	if !strings.Contains(string(reData), `"load_balancing"`) || !strings.Contains(string(reData), `"cache_key"`) {
+		t.Fatalf("Extra fields lost on re-marshal: %s", string(reData))
 	}
 }

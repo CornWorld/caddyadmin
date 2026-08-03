@@ -129,12 +129,16 @@ type Route struct {
 
 ```go
 type MatchRule struct {
-    Path    []string            `json:"path,omitempty"`   // Glob ["/api/*"]
-    Host    []string            `json:"host,omitempty"`   // ["*.example.com"]
-    Header  map[string][]string `json:"header,omitempty"`
-    Method  []string            `json:"method,omitempty"` // ["GET","POST"]
-    NotIP   []string            `json:"not_ip,omitempty"`
-    IP      []string            `json:"ip,omitempty"`
+    Path     []string             `json:"path,omitempty"`      // Glob ["/api/*"]
+    Host     []string             `json:"host,omitempty"`      // ["*.example.com"]
+    Header   map[string][]string  `json:"header,omitempty"`
+    Method   []string             `json:"method,omitempty"`    // ["GET","POST"]
+    RemoteIP *RemoteIPMatch       `json:"remote_ip,omitempty"` // {"ranges": [...], "except": [...]}
+}
+
+type RemoteIPMatch struct {
+    Ranges []string `json:"ranges,omitempty"` // CIDR ranges to match
+    Except []string `json:"except,omitempty"` // IPs to exclude
 }
 ```
 
@@ -157,10 +161,11 @@ type Handler struct {
     IndexNames      []string      `json:"index_names,omitempty"`    // file_server index file names
     Browse          *Browse       `json:"browse,omitempty"`         // file_server directory browsing
     Routes          []Route       `json:"routes,omitempty"`         // subroute nested routes
+    Extra           map[string]any `json:"-"`                       // registered extension fields (see RegisterHandlerFields)
 }
 ```
 
-Fields are validated against a built-in schema registry at marshal time — setting a field a handler doesn't support returns an error. Call `RegisterHandlerFields` to extend the registry for custom/third-party modules.
+Fields are validated against a built-in schema registry at marshal time — setting a field a handler doesn't support returns an error. Call `RegisterHandlerFields` to extend the registry for custom/third-party modules; fields without a dedicated Go field are carried on `Handler.Extra` and round-trip through `MarshalJSON`/`UnmarshalJSON`.
 
 ### HeaderPolicy
 
@@ -271,7 +276,7 @@ The `Handler.Headers` field marshals differently depending on `Handler.Handler`:
 
 - **`reverse_proxy`**: headers marshal as the nested `HeaderPolicy` object under a `"headers"` key (`{"headers": {"request": {...}, "response": {...}}}`).
 - **`headers` (standalone)**: request/response emit flattened at the handler top level (`{"request": {...}, "response": {...}}`), NOT nested under a `"headers"` key.
-- **`static_response`**: headers marshal as a flat `map[string][]string` (http.Header shape). Add/Delete/Request sub-fields are rejected with an error.
+- **`static_response`**: headers marshal as a flat `map[string][]string` (http.Header shape). Only `Response.Set` is expressible — Add/Delete/Replace/Require/Deferred and Request headers are rejected with an error.
 - **`file_server`**: rejected entirely — Caddy's `file_server` module has no `headers` field. Setting `Headers` returns an error.
 
 ### 4b. Field Schema Validation

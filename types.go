@@ -7,6 +7,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // Route represents a single Caddy route with optional @id for stable identification.
@@ -136,6 +137,13 @@ type Handler struct {
 
 	// Routes for subroute handler (nested routes).
 	Routes []Route `json:"routes,omitempty"`
+
+	// Extra carries JSON fields for handler modules that have no dedicated Go
+	// field on this struct — typically registered via RegisterHandlerFields.
+	// UnmarshalJSON captures unknown keys here and MarshalJSON re-emits them,
+	// so third-party / custom handler fields round-trip losslessly. The tag
+	// opts encoding/json out; MarshalJSON/UnmarshalJSON handle it manually.
+	Extra map[string]any `json:"-"`
 }
 
 // Upstream defines a single upstream backend for reverse_proxy.
@@ -154,12 +162,12 @@ type HeaderPolicy struct {
 // HeaderOps defines request and response header operations.
 // See: https://caddyserver.com/docs/json/apps/http/servers/routes/handle/headers
 type HeaderOps struct {
-	Add    map[string][]string        `json:"add,omitempty"`    // Add headers; does not replace existing.
-	Set    map[string][]string        `json:"set,omitempty"`    // Set headers; replaces existing values.
-	Delete []string                   `json:"delete,omitempty"` // Delete header fields (wildcards supported).
-	Replace map[string][]Replacement  `json:"replace,omitempty"` // In-situ substring replacements.
+	Add     map[string][]string      `json:"add,omitempty"`     // Add headers; does not replace existing.
+	Set     map[string][]string      `json:"set,omitempty"`     // Set headers; replaces existing values.
+	Delete  []string                 `json:"delete,omitempty"`  // Delete header fields (wildcards supported).
+	Replace map[string][]Replacement `json:"replace,omitempty"` // In-situ substring replacements.
 	// Response-only fields (ignored for request headers by Caddy):
-	Require  *ResponseMatcher `json:"require,omitempty"` // Defer ops until response matches these criteria.
+	Require  *ResponseMatcher `json:"require,omitempty"`  // Defer ops until response matches these criteria.
 	Deferred bool             `json:"deferred,omitempty"` // Defer ops until response headers are written.
 }
 
@@ -424,7 +432,14 @@ var knownHandlerFields = map[string]map[string]struct{}{
 //
 // The handler name should match the admin API module name (e.g. "cache").
 // Fields is the list of valid top-level JSON keys for that module.
+// handlerFieldsMu guards knownHandlerFields. The built-in registry is
+// initialized at package init; all subsequent reads and writes go through this
+// mutex so RegisterHandlerFields / HandlerFieldSet are safe for concurrent use.
+var handlerFieldsMu sync.RWMutex
+
 func RegisterHandlerFields(handler string, fields []string) {
+	handlerFieldsMu.Lock()
+	defer handlerFieldsMu.Unlock()
 	if _, ok := knownHandlerFields[handler]; !ok {
 		knownHandlerFields[handler] = make(map[string]struct{}, len(fields))
 	}
@@ -433,10 +448,21 @@ func RegisterHandlerFields(handler string, fields []string) {
 	}
 }
 
-// HandlerFieldSet returns the known JSON field set for a handler module.
-// Returns nil if the handler is completely unknown (unregistered).
+// HandlerFieldSet returns a copy of the known JSON field set for a handler
+// module. Returns nil if the handler is completely unknown (unregistered).
+// The copy protects the shared registry from caller mutation.
 func HandlerFieldSet(handler string) map[string]struct{} {
-	return knownHandlerFields[handler]
+	handlerFieldsMu.RLock()
+	defer handlerFieldsMu.RUnlock()
+	fields, ok := knownHandlerFields[handler]
+	if !ok {
+		return nil
+	}
+	out := make(map[string]struct{}, len(fields))
+	for k := range fields {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 // Validate checks that all non-zero fields on this Handler are valid for its
@@ -525,20 +551,20 @@ func (h Handler) Validate() error {
 // handlerRaw is the default marshal output of Handler with the Headers field
 // omitted. MarshalJSON fills Headers separately depending on Handler kind.
 type handlerRaw struct {
-	Handler         string      `json:"handler"`
-	Upstreams       []Upstream  `json:"upstreams,omitempty"`
-	StatusCode      int         `json:"status_code,omitempty"`
-	Body            string      `json:"body,omitempty"`
-	URI             string      `json:"uri,omitempty"`
-	StripPathPrefix string      `json:"strip_path_prefix,omitempty"`
-	StripPathSuffix string      `json:"strip_path_suffix,omitempty"`
-	Method          string      `json:"method,omitempty"`
-	URISubstring    []URISubst  `json:"uri_substring,omitempty"`
-	Root            string      `json:"root,omitempty"`
-	Hide            []string    `json:"hide,omitempty"`
-	IndexNames      []string    `json:"index_names,omitempty"`
-	Browse          *Browse     `json:"browse,omitempty"`
-	Routes          []Route     `json:"routes,omitempty"`
+	Handler         string     `json:"handler"`
+	Upstreams       []Upstream `json:"upstreams,omitempty"`
+	StatusCode      int        `json:"status_code,omitempty"`
+	Body            string     `json:"body,omitempty"`
+	URI             string     `json:"uri,omitempty"`
+	StripPathPrefix string     `json:"strip_path_prefix,omitempty"`
+	StripPathSuffix string     `json:"strip_path_suffix,omitempty"`
+	Method          string     `json:"method,omitempty"`
+	URISubstring    []URISubst `json:"uri_substring,omitempty"`
+	Root            string     `json:"root,omitempty"`
+	Hide            []string   `json:"hide,omitempty"`
+	IndexNames      []string   `json:"index_names,omitempty"`
+	Browse          *Browse    `json:"browse,omitempty"`
+	Routes          []Route    `json:"routes,omitempty"`
 }
 
 // MarshalJSON serializes Handler. Fields are validated against the handler
@@ -570,7 +596,17 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 	}
 
 	if h.Headers == nil {
-		return json.Marshal(raw)
+		// No headers: marshal the struct directly to preserve its field order.
+		// Registered extension fields (Extra) must be merged in, so fall back to
+		// a map whenever Extra is non-empty.
+		if len(h.Extra) == 0 {
+			return json.Marshal(raw)
+		}
+		m := rawToMap(raw)
+		for k, v := range h.Extra {
+			m[k] = v
+		}
+		return json.Marshal(m)
 	}
 
 	if h.Handler == "file_server" {
@@ -579,9 +615,14 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 	}
 
 	if h.Handler == "static_response" {
-		// Caddy's static_response only supports Response.Set as a flat map.
-		if h.Headers.Response != nil && (len(h.Headers.Response.Add) > 0 || len(h.Headers.Response.Delete) > 0) {
-			return nil, fmt.Errorf("caddyadmin: static_response handler does not support header Add/Delete operations")
+		// Caddy's static_response headers is a plain http.Header map and can
+		// only express Response.Set. Reject every other header operation so it
+		// is never silently dropped on the wire.
+		if h.Headers.Response != nil {
+			resp := h.Headers.Response
+			if len(resp.Add) > 0 || len(resp.Delete) > 0 || len(resp.Replace) > 0 || resp.Require != nil || resp.Deferred {
+				return nil, fmt.Errorf("caddyadmin: static_response handler only supports Response.Set headers")
+			}
 		}
 		if h.Headers.Request != nil {
 			return nil, fmt.Errorf("caddyadmin: static_response handler does not support request headers")
@@ -590,32 +631,33 @@ func (h Handler) MarshalJSON() ([]byte, error) {
 		if h.Headers.Response != nil {
 			maps.Copy(flat, h.Headers.Response.Set)
 		}
-		return marshalHandlerWithHeaders(raw, flat)
+		return marshalHandlerWithHeaders(raw, flat, h.Extra)
 	}
 	if h.Handler == "headers" {
 		// The standalone `headers` directive carries request/response at the
 		// handler top level, NOT under a `headers` field (unlike reverse_proxy,
 		// whose HeaderPolicy lives at `headers`). Emit them flattened.
-		m := map[string]any{"handler": "headers"}
-		if h.Headers != nil {
-			if h.Headers.Request != nil {
-				m["request"] = h.Headers.Request
-			}
-			if h.Headers.Response != nil {
-				m["response"] = h.Headers.Response
-			}
+		m := rawToMap(raw)
+		for k, v := range h.Extra {
+			m[k] = v
+		}
+		if h.Headers.Request != nil {
+			m["request"] = h.Headers.Request
+		}
+		if h.Headers.Response != nil {
+			m["response"] = h.Headers.Response
 		}
 		return json.Marshal(m)
 	}
-	return marshalHandlerWithHeaders(raw, h.Headers)
+	return marshalHandlerWithHeaders(raw, h.Headers, h.Extra)
 }
 
-// marshalHandlerWithHeaders builds the JSON by combining handlerRaw fields and
-// headers into a single map, avoiding fragile byte-level JSON manipulation.
-func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
+// rawToMap converts the typed handlerRaw fields into a map for JSON emission.
+// json.Marshal sorts map keys alphabetically; rawToMap is used whenever
+// headers or registered extension fields must be merged into the output.
+func rawToMap(raw handlerRaw) map[string]any {
 	m := map[string]any{
 		"handler": raw.Handler,
-		"headers": headers,
 	}
 	if raw.Upstreams != nil {
 		m["upstreams"] = raw.Upstreams
@@ -656,14 +698,27 @@ func marshalHandlerWithHeaders(raw handlerRaw, headers any) ([]byte, error) {
 	if raw.Routes != nil {
 		m["routes"] = raw.Routes
 	}
+	return m
+}
+
+// marshalHandlerWithHeaders builds the JSON by combining handlerRaw fields and
+// headers into a single map, avoiding fragile byte-level JSON manipulation.
+// Registered extension fields from extra are merged in (typed/known keys win).
+func marshalHandlerWithHeaders(raw handlerRaw, headers any, extra map[string]any) ([]byte, error) {
+	m := rawToMap(raw)
+	for k, v := range extra {
+		m[k] = v
+	}
+	m["headers"] = headers
 	return json.Marshal(m)
 }
 
 // UnmarshalJSON decodes a Handler, mirroring MarshalJSON's per-handler
 // Headers shape. static_response handlers carry a flat map[string][]string
 // (http.Header shape); every other handler carries the nested HeaderPolicy
-// shape. This makes round-tripping a live config (GET /config then edit)
-// lossless instead of silently dropping static_response header manipulation.
+// shape. Keys not explicitly modeled are captured into Extra so they are not
+// silently dropped — this makes round-tripping a live config (GET /config
+// then edit) lossless.
 func (h *Handler) UnmarshalJSON(data []byte) error {
 	// Decode into a map first so we can dispatch on the handler name.
 	var raw map[string]json.RawMessage
@@ -722,6 +777,17 @@ func (h *Handler) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
+	// Keys explicitly decoded above are "handled". Every other key in the input
+	// is captured into Extra so registered / third-party fields (and any keys
+	// a live Caddy config carries that this package doesn't model) round-trip
+	// losslessly instead of being silently dropped.
+	handled := map[string]bool{
+		"handler": true, "upstreams": true, "status_code": true, "body": true,
+		"uri": true, "routes": true, "root": true, "strip_path_prefix": true,
+		"strip_path_suffix": true, "method": true, "uri_substring": true,
+		"hide": true, "index_names": true, "browse": true,
+	}
+
 	if h.Handler == "headers" {
 		// The standalone `headers` directive carries request/response at the
 		// handler top level (not under `headers`), mirroring MarshalJSON.
@@ -733,29 +799,43 @@ func (h *Handler) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		h.Headers = hp
-		return nil
+		handled["request"] = true
+		handled["response"] = true
+	} else if hdr, ok := raw["headers"]; ok && len(hdr) > 0 && string(hdr) != "null" {
+		if h.Handler == "static_response" {
+			// static_response headers are a flat http.Header map.
+			var flat map[string][]string
+			if err := json.Unmarshal(hdr, &flat); err != nil {
+				return err
+			}
+			h.Headers = &HeaderPolicy{Response: &HeaderOps{Set: flat}}
+		} else {
+			// All other handlers use the nested HeaderPolicy shape.
+			var hp HeaderPolicy
+			if err := json.Unmarshal(hdr, &hp); err != nil {
+				return err
+			}
+			h.Headers = &hp
+		}
+		handled["headers"] = true
 	}
 
-	hdr, ok := raw["headers"]
-	if !ok || len(hdr) == 0 || string(hdr) == "null" {
-		return nil
-	}
-
-	if h.Handler == "static_response" {
-		// static_response headers are a flat http.Header map.
-		var flat map[string][]string
-		if err := json.Unmarshal(hdr, &flat); err != nil {
+	for k, v := range raw {
+		if handled[k] {
+			continue
+		}
+		if len(v) == 0 || string(v) == "null" {
+			continue
+		}
+		var val any
+		if err := json.Unmarshal(v, &val); err != nil {
 			return err
 		}
-		h.Headers = &HeaderPolicy{Response: &HeaderOps{Set: flat}}
-		return nil
+		if h.Extra == nil {
+			h.Extra = make(map[string]any)
+		}
+		h.Extra[k] = val
 	}
 
-	// All other handlers use the nested HeaderPolicy shape.
-	var hp HeaderPolicy
-	if err := json.Unmarshal(hdr, &hp); err != nil {
-		return err
-	}
-	h.Headers = &hp
 	return nil
 }
