@@ -371,12 +371,25 @@ type AutomationPolicy struct {
 	Issuers  []Issuer `json:"issuers,omitempty"`
 }
 
-// OnDemandTLS corresponds to tls.automation.on_demand. The Ask endpoint is
-// vanblog's own /api/hooks/caddy/ask, which returns 2xx for allowlisted
-// domains and non-2xx otherwise — this is the core of vanblog's on-demand
-// TLS allowlist.
+// OnDemandTLS corresponds to tls.automation.on_demand.
+//
+// Permission is REQUIRED by Caddy >= 2.11 (a bare ask-only config is
+// rejected at provision time: "on-demand TLS cannot be enabled without a
+// permission module"). The http permission module is the drop-in successor
+// of the deprecated ask field with identical wire semantics: 2xx allows the
+// certificate, anything else denies; a "domain" query parameter is appended.
+// Ask is kept only for stacks still pinned to Caddy <= 2.9.
 type OnDemandTLS struct {
-	Ask string `json:"ask,omitempty"`
+	Ask        string          `json:"ask,omitempty"`
+	Permission *PermissionHTTP `json:"permission,omitempty"`
+}
+
+// PermissionHTTP is the tls.permission.http module: an inline permission
+// module that delegates the allow/deny decision to an HTTP endpoint.
+// See Caddy's modules/caddytls/ondemand.go (PermissionByHTTP).
+type PermissionHTTP struct {
+	Module   string `json:"module"` // "http"
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 // Issuer is one certificate issuer under an AutomationPolicy. vanblog lets

@@ -111,6 +111,10 @@ func TestConfigMarshalRoundTrip(t *testing.T) {
 				Automation: &Automation{
 					OnDemand: &OnDemandTLS{
 						Ask: "http://127.0.0.1:8090/api/hooks/caddy/ask",
+						Permission: &PermissionHTTP{
+							Module:   "http",
+							Endpoint: "http://127.0.0.1:8090/api/hooks/caddy/ask",
+						},
 					},
 					Policies: []AutomationPolicy{{
 						OnDemand: true,
@@ -172,6 +176,14 @@ func TestConfigMarshalRoundTrip(t *testing.T) {
 		back.Apps.TLS.Automation.OnDemand == nil ||
 		back.Apps.TLS.Automation.OnDemand.Ask != "http://127.0.0.1:8090/api/hooks/caddy/ask" {
 		t.Fatalf("round-trip: on_demand.ask mismatch: %+v", back.Apps.TLS.Automation)
+	}
+	perm := back.Apps.TLS.Automation.OnDemand.Permission
+	if perm == nil || perm.Module != "http" ||
+		perm.Endpoint != "http://127.0.0.1:8090/api/hooks/caddy/ask" {
+		t.Fatalf("round-trip: on_demand.permission mismatch: %+v", perm)
+	}
+	if !strings.Contains(jsonStr, `"permission":{"module":"http","endpoint":`) {
+		t.Fatalf("marshaled on_demand.permission inline module missing:\n%s", jsonStr)
 	}
 	if len(back.Apps.TLS.Automation.Policies) != 1 || !back.Apps.TLS.Automation.Policies[0].OnDemand {
 		t.Fatalf("round-trip: automation policy mismatch: %+v", back.Apps.TLS.Automation.Policies)
